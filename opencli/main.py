@@ -1270,50 +1270,13 @@ def call_model(provider_name, provider_model, key, messages):
   except Exception as e: return f"[red]Error: {str(e)}[/red]"
 
 def get_multiline_input(prompt="› "):
-  """Multi-line input: Enter to send, Ctrl+Enter for newline, Shift+Tab to cycle mode."""
-  if HAS_PROMPT_TOOLKIT:
-    from prompt_toolkit.key_binding import KeyBindings
-    from prompt_toolkit.keys import Keys
-
-    # Custom key bindings
-    kb = KeyBindings()
-
-    @kb.add(Keys.Enter)  # Plain Enter sends
-    def _(event):
-      """Accept input on Enter"""
-      event.current_buffer.validate_and_set()
-      event.app.exit()
-
-    @kb.add(Keys.ControlEnter)  # Ctrl+Enter for newline
-    def _(event):
-      """Insert newline on Ctrl+Enter"""
-      event.current_buffer.insert_text('\n')
-
-    @kb.add(Keys.ShiftTab)  # Shift+Tab to cycle modes
-    def _(event):
-      """Cycle mode on Shift+Tab"""
-      event.app.exit_with_exception(KeyboardInterrupt("MODE_CYCLE"))
-
-    @kb.add(Keys.Escape)
-    def _(event):
-      """Cancel with Escape"""
-      event.app.exit_with_exception(KeyboardInterrupt())
-
-    session = PromptSession(key_bindings=kb)
-    try:
-      return session.prompt(
-        prompt,
-        multiline=True,
-        editing_mode=EditingMode.VI,
-      )
-    except KeyboardInterrupt as e:
-      # Check if this is a mode cycle request
-      if str(e) == "MODE_CYCLE":
-        return "MODE_CYCLE"
-      return ""
-  else:
-    console.print(f"[bold {get_theme_color('text')}]{prompt}[/bold {get_theme_color('text')}]", end="")
+  """Simple input: Enter to send, Shift+Tab to cycle mode."""
+  # Use basic input - simple and reliable
+  console.print(f"[bold {get_theme_color('text')}]{prompt}[/bold {get_theme_color('text')}]", end="")
+  try:
     return input()
+  except KeyboardInterrupt:
+    return ""
 
 def run_onboarding():
   console.clear()
@@ -1449,7 +1412,7 @@ def main():
         f"\n[bold {text_c}]You[/bold {text_c}] "
         "[dim](/ → settings • /resume → load chat • /clear → reset • exit → quit)[/dim]"
       )
-      console.print(f"{mode_text} [dim]Enter=send • Ctrl+Enter=newline • Shift+Tab=cycle mode[/dim]")
+      console.print(f"{mode_text} [dim]Enter=send • Shift+Tab=cycle mode[/dim]")
 
       # Get input with mode cycling support
       while True:
@@ -1463,7 +1426,7 @@ def main():
           mode_text = get_mode_indicator(mode)
           console.print(f"\n{mode_text} Mode changed\n")
           # Show mode indicator again and re-prompt
-          console.print(f"{mode_text} [dim]Enter=send • Ctrl+Enter=newline • Shift+Tab=cycle mode[/dim]")
+          console.print(f"{mode_text} [dim]Enter=send • Shift+Tab=cycle mode[/dim]")
           continue
         break
 
