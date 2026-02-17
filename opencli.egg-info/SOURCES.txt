@@ -1,0 +1,9 @@
+pyproject.toml
+opencli/__init__.py
+opencli/main.py
+opencli.egg-info/PKG-INFO
+opencli.egg-info/SOURCES.txt
+opencli.egg-info/dependency_links.txt
+opencli.egg-info/entry_points.txt
+opencli.egg-info/requires.txt
+opencli.egg-info/top_level.txt

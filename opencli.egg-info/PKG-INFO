@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: opencli
+Version: 0.1.0
+Summary: OpenCLI - autonomous coding agent by curren
+Author: curren
+Requires-Dist: requests
+Requires-Dist: rich

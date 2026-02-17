@@ -1,0 +1,18 @@
+[project]
+name = "opencli"
+version = "0.1.0"
+description = "OpenCLI - autonomous coding agent by curren"
+authors = [
+  { name="curren" }
+]
+dependencies = [
+  "requests",
+  "rich"
+]
+
+[project.scripts]
+opencli = "opencli.main:main"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
