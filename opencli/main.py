@@ -153,73 +153,56 @@ def save_history(messages, session_id=None):
     return session_data["id"]
 
 def get_char(fd):
-    """Reliably read a single character or escape sequence."""
-    r, _, _ = select.select([fd], [], [], 0.01) # Check if data is already waiting
+    """Read full escape sequences safely (fix arrow keys exiting)."""
     ch = sys.stdin.read(1)
-    if ch == '\x1b':
-        # Arrow keys are ESC + [ + A/B/C/D. 
-        # We wait up to 0.15s for the rest of the sequence for high reliability.
-        r, _, _ = select.select([fd], [], [], 0.15)
-        if r:
-            ch2 = sys.stdin.read(1)
-            if ch2 == '[':
-                r, _, _ = select.select([fd], [], [], 0.1)
-                if r:
-                    ch3 = sys.stdin.read(1)
-                    return f"ESC[{ch3}"
+
+    if ch == '\x1b':  # ESC
+        seq = ch
+        # Try to read the rest of the escape sequence
+        for _ in range(2):
+            r, _, _ = select.select([fd], [], [], 0.05)
+            if r:
+                seq += sys.stdin.read(1)
+            else:
+                break
+
+        if seq.startswith('\x1b[') and len(seq) == 3:
+            return f"ESC[{seq[2]}"
         return "ESC"
+
     return ch
 
-def select_session_tui():
-    history = load_history()
-    all_sessions = history.get("sessions", [])
-    cwd = os.getcwd()
-    
-    local = [s for s in all_sessions if s.get("cwd") == cwd]
-    other = [s for s in all_sessions if s.get("cwd") != cwd]
-    sessions = local + other
 
-    if not sessions: return None
-    
-    idx = 0
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    
-    try:
-        # Enter persistent TUI mode
-        tty.setraw(fd)
-        console.show_cursor = False
-        with Live(refresh_per_second=20, screen=False, auto_refresh=True) as live:
-            while True:
-                # Render
-                table = Table(title="[bold cyan]Resume Recent Chat[/bold cyan]", box=box.ROUNDED, show_header=False)
-                for i, s in enumerate(sessions):
-                    is_local = s.get("cwd") == cwd
-                    style = "bold green" if i == idx else ("cyan" if is_local else "white")
-                    prefix = " > " if i == idx else "   "
-                    local_tag = "[dim](here)[/dim] " if is_local else ""
-                    dt = time.strftime("%H:%M", time.localtime(s["timestamp"]))
-                    table.add_row(f"[{style}]{prefix}{local_tag}{s['title']} [dim]({dt})[/dim][/{style}]")
-                
-                live.update(Align.center(Panel(table, subtitle="[dim]↑/↓: Navigate • Enter: Resume • Esc/Q: Cancel[/dim]", border_style="dim")))
-                
-                # Input
-                key = get_char(fd)
-                
-                if key == "ESC" or key.lower() == "q":
-                    return None
-                elif key == "ESC[A": # UP
-                    idx = (idx - 1) % len(sessions)
-                elif key == "ESC[B": # DOWN
-                    idx = (idx + 1) % len(sessions)
-                elif key in ["\r", "\n"]:
-                    return sessions[idx]
-    finally:
-        console.show_cursor = True
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        # Final buffer drain
-        while select.select([fd], [], [], 0.01)[0]:
-            sys.stdin.read(1)
+def select_session_menu():
+    console.clear()
+    history = load_history()
+    sessions = history.get("sessions", [])
+    cwd = os.getcwd()
+
+    if not sessions:
+        console.print(Panel("No recent sessions found.", style="yellow"))
+        console.input("Press Enter to return...")
+        return None
+
+    console.print(Panel("[bold cyan]Resume Recent Chat[/bold cyan]", border_style="cyan"))
+
+    while True:
+        console.print()
+        for i, s in enumerate(sessions, 1):
+            is_local = s.get("cwd") == cwd
+            tag = "[dim](here)[/dim] " if is_local else ""
+            dt = time.strftime("%H:%M", time.localtime(s["timestamp"]))
+            console.print(f"[cyan]{i}.[/cyan] {tag}{s['title']} [dim]({dt})[/dim]")
+
+        console.print("\n[dim]Enter number to resume • q to cancel[/dim]")
+        choice = console.input("› ").strip()
+
+        if choice.lower() == "q":
+            return None
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(sessions):
+                return sessions[idx]
 
 def load_config():
     defaults = {
@@ -298,6 +281,9 @@ def get_theme_color(color_name):
 
 def banner(mode, model):
     console.clear()
+
+    cwd = os.getcwd().replace(os.path.expanduser("~"), "~")
+
     logo = r"""
    _  ____  _____ _   _  ____ _     ___ 
   / \|  _ \|  ___| \ | |/ ___| |   |_ _|
@@ -305,129 +291,147 @@ def banner(mode, model):
  | | |  __/| |___| |\  | |___| |___ | | 
   \_/|_|   |_____|_| \_|\____|_____|___|
 """
-    
-    primary = get_theme_color("primary")
-    secondary = get_theme_color("secondary")
-    text_color = get_theme_color("text")
-    
-    logo_text = Text(logo, style=primary)
-    cwd = os.getcwd().replace(os.path.expanduser("~"), "~")
-    
-    splash_content = Text.assemble(
-        logo_text,
-        Text.from_markup(f"\n[dim]- by curren -[/dim]\n"),
-        Text.from_markup(f"\n[bold {text_color}]Folder:[/bold {text_color}] [blue]{cwd}[/blue]"),
-        Text.from_markup(f"\n[bold {text_color}]Model: [/bold {text_color}] [{secondary}]{model}[/{secondary}]"),
-        Text.from_markup(f"\n[bold {text_color}]Mode:  [/bold {text_color}] [bold {'yellow' if mode == 'safe' else 'red'}]{mode.upper()}[/bold {'yellow' if mode == 'safe' else 'red'}]")
+
+    ghost = """
+⠀⠀⠀⠀⠀⠀⠀⢀⠤⠐⠀⠀⠒⠂⠄⡀⠀⠀
+⠀⠀⠀⠀⠀⠀⡠⠁⠀⠀⠀⠀⠀⠀⠀⢸⣦⠀
+⠀⠀⠀⠀⠀⠰⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠻⢃
+⠀⠀⠀⠀⢠⠃⠀⠀⠀⠀⢠⣄⠀⠀⠀⢀⣀⠘
+⠀⠀⠀⠀⠌⠀⠀⠀⠀⢀⠘⢍⠀⣄⠤⡨⠯⠀
+⠀⠀⠀⡐⠀⠀⠀⠀⠀⠈⠈⠃⠀⠀⠀⠑⠒⠸
+⠀⠀⢠⣱⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⠇
+⠀⡠⠻⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡌⠀
+⠔⠁⣼⣐⡄⠀⠀⠀⢠⠀⠀⠀⠀⡄⠀⡜⠀⠀
+⠑⠚⠉⠀⡄⠀⢀⠴⡏⠀⠀⢠⢞⣧⠌⠀⠀⠀
+⠀⠀⠀⠀⠑⠚⠓⠉⠗⠧⠒⠉⠉⠀⠀⠀⠀⠀
+"""
+    ghost = "\n".join(line[3:] if len(line) >= 4 else line for line in ghost.splitlines())
+
+    left_block = Text.assemble(
+        (logo, "green"),
+        ("\n- by curren -\n", "dim"),
+        (f"\nFolder: {cwd}", "green"),
+        (f"\nModel:  {model}", "green"),
+        (f"\nMode:   {mode.upper()}\n", "bold yellow" if mode == "safe" else "bold red"),
+        ("\nTip: SAFE mode asks before tools • UNSAFE auto-runs.\n", "dim")
     )
-    
-    console.print(Align.center(Panel(splash_content, box=box.ROUNDED, border_style="dim", padding=(1, 4))))
+
+    from rich.columns import Columns
+
+    combined_layout = Columns(
+        [
+            left_block,
+            Text(ghost, style="green")
+        ],
+        expand=True,
+        equal=False
+    )
+
+    console.print(
+        Panel(
+            combined_layout,
+            box=box.ROUNDED,
+            border_style="green",
+            padding=(1, 2)
+        )
+    )
 
 # =====================================================
 # SETTINGS
 # =====================================================
 
 def interactive_settings_menu():
-    options = [
-        {"name": "Provider", "key": "provider", "type": "toggle", "values": ["OpenRouter", "Anthropic", "Google", "OpenAI", "NVIDIA", "Ollama"]},
-        {"name": "Model", "key": "model", "type": "input"},
-        {"name": "Ollama URL", "key": "ollama_url", "type": "input"},
-        {"name": "Theme", "key": "theme", "type": "toggle", "values": ["dark", "light"]},
-        {"name": "Execution Mode", "key": "mode", "type": "toggle", "values": ["safe", "unsafe"]},
-        {"name": "Max Tokens", "key": "max_tokens", "type": "input"},
-        {"name": "Compaction Threshold (%)", "key": "compaction_threshold", "type": "input"},
-        {"name": "Anthropic API Key", "key": "anthropic_key", "type": "input"},
-        {"name": "Google API Key", "key": "google_key", "type": "input"},
-        {"name": "OpenAI API Key", "key": "openai_key", "type": "input"},
-        {"name": "NVIDIA API Key", "key": "nvidia_key", "type": "input"},
-        {"name": "OpenRouter API Key", "key": "openrouter_key", "type": "input"},
-    ]
-    
-    selected_idx = 0
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    
-    try:
-        tty.setraw(fd)
-        console.show_cursor = False
-        with Live(refresh_per_second=20, screen=False, auto_refresh=True) as live:
-            while True:
-                table = Table(title="[bold cyan]OpenCLI Settings[/bold cyan]", box=box.ROUNDED)
-                table.add_column("Setting", style="cyan", width=25)
-                table.add_column("Value", style="dim", width=30, no_wrap=True)
-                
-                for i, opt in enumerate(options):
-                    prefix = "› " if i == selected_idx else "  "
-                    style = "bold yellow" if i == selected_idx else "white"
-                    val = config.get(opt["key"], "")
-                    if opt["type"] == "toggle":
-                        val_str = str(val).upper()
-                        val_display = f"[bold green]{val_str}[/bold green]" if val in ["safe", "NVIDIA", "Anthropic", "dark", "OpenRouter", "OpenAI", "Google", "Ollama"] else f"[bold red]{val_str}[/bold red]"
-                    else:
-                        v = str(val)
-                        masked = v[:4] + "..." + v[-4:] if len(v) > 12 else v
-                        val_display = f"[green]SET[/green] [dim]{masked}[/dim]" if val else "[red]EMPTY[/red]"
-                    table.add_row(f"{prefix}{opt['name']}", val_display, style=style)
+    console.clear()
+    console.print(Panel("[bold cyan]OpenCLI Settings[/bold cyan]", border_style="cyan"))
 
-                live.update(Align.center(Panel(table, subtitle="[dim]↑/↓: Navigate • Enter: Change • Esc/Q: Exit[/dim]", border_style="dim")))
-                
-                key = get_char(fd)
-                if key == "ESC" or key.lower() == "q": break
-                elif key == "ESC[A": selected_idx = (selected_idx - 1) % len(options)
-                elif key == "ESC[B": selected_idx = (selected_idx + 1) % len(options)
-                elif key in ["\r", "\n"]:
-                    opt = options[selected_idx]
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
-                    live.stop()
-                    
-                    if opt["type"] == "toggle":
-                        vals = opt["values"]
-                        cur = config.get(opt["key"])
-                        try:
-                            new_idx = (vals.index(cur) + 1) % len(vals)
-                        except (ValueError, KeyError):
-                            new_idx = 0
-                        new_val = vals[new_idx]
-                        config[opt["key"]] = new_val
-                        
-                        if opt["key"] == "provider":
-                            pm = config.get("provider_models", {})
-                            last_model = pm.get(new_val)
-                            if new_val == "OpenRouter":
-                                config["url"], config["model"] = "https://openrouter.ai/api/v1/chat/completions", last_model or "anthropic/claude-3.5-sonnet"
-                            elif new_val == "Anthropic":
-                                config["url"], config["model"] = "https://api.anthropic.com/v1/messages", last_model or "claude-3-5-sonnet-20240620"
-                            elif new_val == "Google":
-                                config["url"], config["model"] = "https://generativelanguage.googleapis.com/v1beta/models/", last_model or "gemini-3-pro"
-                            elif new_val == "OpenAI":
-                                config["url"], config["model"] = "https://api.openai.com/v1/chat/completions", last_model or "gpt-5.3-codex"
-                            elif new_val == "NVIDIA":
-                                config["url"], config["model"] = "https://integrate.api.nvidia.com/v1/chat/completions", last_model or "moonshotai/kimi-k2.5"
-                            elif new_val == "Ollama":
-                                config["url"], config["model"] = config.get("ollama_url", "http://localhost:11434/v1/chat/completions"), last_model or "llama3"
-                            pm[new_val] = config["model"]
-                            config["provider_models"] = pm
-                        save_config(config)
-                    else:
-                        console.clear()
-                        new = input(f"Edit {opt['name']} (Empty to cancel): ").strip()
-                        if new:
-                            val = "" if new.lower() == "clear" else new
-                            config[opt["key"]] = val
-                            if opt["key"] == "model":
-                                pm = config.get("provider_models", {})
-                                pm[config.get("provider", "OpenRouter")] = val
-                                config["provider_models"] = pm
-                            save_config(config)
-                    
-                    live.start()
-                    tty.setraw(fd)
-    finally:
-        console.show_cursor = True
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        while select.select([fd], [], [], 0.01)[0]:
-            sys.stdin.read(1)
-    
+    options = [
+        ("Provider", "provider"),
+        ("Model", "model"),
+        ("Ollama URL", "ollama_url"),
+        ("Theme", "theme"),
+        ("Execution Mode", "mode"),
+        ("Max Tokens", "max_tokens"),
+        ("Compaction Threshold (%)", "compaction_threshold"),
+        ("Anthropic API Key", "anthropic_key"),
+        ("Google API Key", "google_key"),
+        ("OpenAI API Key", "openai_key"),
+        ("NVIDIA API Key", "nvidia_key"),
+        ("OpenRouter API Key", "openrouter_key"),
+    ]
+
+    while True:
+        console.print()
+        for i, (name, key) in enumerate(options, 1):
+            value = str(config.get(key, ""))
+            if "key" in key and value:
+                value = value[:4] + "..." + value[-4:]
+            console.print(f"[cyan]{i}.[/cyan] {name}: [green]{value if value else 'EMPTY'}[/green]")
+
+        console.print("\n[dim]Enter number to edit • q to exit[/dim]")
+        choice = console.input("› ").strip()
+
+        if choice.lower() == "q":
+            break
+
+        if not choice.isdigit():
+            continue
+
+        idx = int(choice) - 1
+        if idx < 0 or idx >= len(options):
+            continue
+
+        name, key = options[idx]
+
+        # Provider selection (dropdown style)
+        if key == "provider":
+            console.print("\nSelect Provider:")
+            providers = ["OpenRouter", "Anthropic", "Google", "OpenAI", "NVIDIA", "Ollama"]
+            for i, p in enumerate(providers, 1):
+                console.print(f"[cyan]{i}.[/cyan] {p}")
+            choice = console.input("› ").strip()
+            if choice.isdigit() and 1 <= int(choice) <= len(providers):
+                new_provider = providers[int(choice) - 1]
+                config["provider"] = new_provider
+                default_models = config.get("provider_models", {})
+                config["model"] = default_models.get(new_provider, config.get("model"))
+                save_config(config)
+                console.print("[green]Provider updated.[/green]")
+            continue
+
+        # Theme editing (dropdown style)
+        if key == "theme":
+            console.print("\nTheme Options:")
+            console.print("[cyan]1.[/cyan] dark")
+            console.print("[cyan]2.[/cyan] light")
+            t_choice = console.input("› ").strip()
+            if t_choice == "1":
+                config["theme"] = "dark"
+            elif t_choice == "2":
+                config["theme"] = "light"
+            save_config(config)
+            console.print("[green]Theme updated.[/green]")
+            continue
+
+        # Execution Mode editing (clarity)
+        if key == "mode":
+            console.print("\nExecution Mode:")
+            console.print("[cyan]1.[/cyan] SAFE  (approval required before tools)")
+            console.print("[cyan]2.[/cyan] UNSAFE (auto-executes tools — dangerous)")
+            m_choice = console.input("› ").strip()
+            if m_choice == "1":
+                config["mode"] = "safe"
+            elif m_choice == "2":
+                config["mode"] = "unsafe"
+            save_config(config)
+            console.print("[green]Mode updated.[/green]")
+            continue
+
+        new_val = console.input(f"New value for {name} (leave blank to cancel): ").strip()
+        if new_val:
+            config[key] = new_val
+            save_config(config)
+            console.print("[green]Updated.[/green]")
+
     console.clear()
 
 # =====================================================
@@ -512,22 +516,55 @@ def get_system_prompt():
         with open(prompt_path, "r") as f: return f.read()
     return "You are OpenCLI, an autonomous coding agent."
 
-SYSTEM_PROMPT = get_system_prompt()
+SYSTEM_PROMPT = get_system_prompt() + """
+
+=== TOOL USAGE RULES (STRICT) ===
+When you decide to use a tool:
+- Output ONLY a single JSON object.
+- Do NOT wrap it in backticks.
+- Do NOT prefix it with Thought:, Action:, or Explanation.
+- Do NOT include any text before or after the JSON.
+- The format MUST be exactly:
+
+{"tool": "tool_name", "args": { ... }}
+
+After a tool result is returned, you may respond normally.
+
+Never simulate tool execution.
+Never describe a tool call — only emit valid JSON.
+"""
 
 def extract_json(text):
-    try:
-        match = re.search(r'(\{.*\})', text, re.DOTALL)
-        if match:
-            json_str = match.group(1)
-            obj = json.loads(json_str)
-            if "tool" in obj:
-                clean_text = text.replace(json_str, "").strip()
-                clean_text = re.sub(r'```json\s*```', '', clean_text).strip()
-                clean_text = re.sub(r'```\s*$', '', clean_text).strip()
-                return clean_text, obj
-    except: pass
-    text = re.sub(r'```json\s*```', '', text).strip()
-    return text, None
+    """
+    Extract first valid tool JSON object from model output.
+    Safely handles malformed trailing braces and embedded text.
+    """
+    cleaned = text.strip()
+
+    # Scan for first balanced JSON object
+    start = None
+    brace_count = 0
+
+    for i, ch in enumerate(cleaned):
+        if ch == "{":
+            if start is None:
+                start = i
+            brace_count += 1
+        elif ch == "}":
+            brace_count -= 1
+            if brace_count == 0 and start is not None:
+                candidate = cleaned[start:i+1]
+                try:
+                    obj = json.loads(candidate)
+                    if isinstance(obj, dict) and "tool" in obj:
+                        visible_text = cleaned[:start].strip()
+                        return visible_text, obj
+                except Exception:
+                    pass
+                start = None
+
+    # No valid tool JSON found
+    return cleaned, None
 
 def check_stop():
     fd = sys.stdin.fileno()
@@ -693,18 +730,38 @@ def main():
     
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     session_id = None
-    if "--resume" in sys.argv:
-        sel = select_session_tui()
-        if sel:
-            messages, session_id = sel["messages"], sel["id"]
-            console.print(f"[dim]📜 Resumed: {sel['title']}[/dim]")
+    resumed = False
 
-    cwd = os.getcwd()
-    files_list = list_files(".")
-    messages.append({"role": "system", "content": f"PROJECT: {cwd}\nFILES:\n{files_list}"})
+    if "--resume" in sys.argv:
+        sel = select_session_menu()
+        if sel:
+            messages = sel["messages"]
+            session_id = sel["id"]
+            resumed = True
+            console.print(f"[dim]📜 Resumed: {sel['title']}[/dim]")
+            time.sleep(1)
+
+    # If resumed, display previous conversation
+    if resumed:
+        banner(config.get("mode", "safe"), config.get("model"))
+        for m in messages:
+            if m["role"] == "assistant":
+                console.print(Panel(m["content"], style="cyan", title="OpenCLI 💭"))
+            elif m["role"] == "user":
+                console.print(f"[bold {get_theme_color('text')}]You[/bold {get_theme_color('text')}] › {m['content']}")
+
+    # Only inject PROJECT context for new sessions
+    if not resumed:
+        cwd = os.getcwd()
+        files_list = list_files(".")
+        messages.append({
+            "role": "system",
+            "content": f"PROJECT: {cwd}\nFILES:\n{files_list}"
+        })
     
     mode = config.get("mode", "safe")
-    banner(mode, config.get("model"))
+    if not resumed:
+        banner(mode, config.get("model"))
 
     while True:
         try:
@@ -718,7 +775,10 @@ def main():
                 return
 
             text_c = get_theme_color("text")
-            console.print(f"\n[bold {text_c}]You[/bold {text_c}] [dim](type / for settings)[/dim]")
+            console.print(
+                f"\n[bold {text_c}]You[/bold {text_c}] "
+                "[dim](/ → settings • /resume → load chat • /clear → reset • exit → quit)[/dim]"
+            )
             user_input = console.input("› ")
 
             if user_input.strip() == "/":
@@ -727,6 +787,27 @@ def main():
                 mode = config.get("mode", "safe")
                 banner(mode, config.get("model"))
                 continue
+
+            if user_input.strip() == "/provider":
+                interactive_settings_menu()
+                config = load_config()
+                banner(config.get("mode", "safe"), config.get("model"))
+                continue
+
+            if user_input.strip() == "/resume":
+                sel = select_session_menu()
+                if sel:
+                    messages = sel["messages"]
+                    session_id = sel["id"]
+                    banner(config.get("mode", "safe"), config.get("model"))
+
+                    # Display previous conversation
+                    for m in messages:
+                        if m["role"] == "assistant":
+                            console.print(Panel(m["content"], style="cyan", title="OpenCLI 💭"))
+                        elif m["role"] == "user":
+                            console.print(f"[bold {get_theme_color('text')}]You[/bold {get_theme_color('text')}] › {m['content']}")
+                continue
             if user_input.strip() == "/clear":
                 messages = [{"role": "system", "content": SYSTEM_PROMPT}]
                 session_id = None
@@ -734,41 +815,74 @@ def main():
                 config = load_config()
                 banner(config.get("mode", "safe"), config.get("model"))
                 continue
-            if user_input.lower() in ["exit", "quit"]: break
+            if user_input.lower() in ["exit", "quit"]:
+                session_id = save_history(messages, session_id)
+                break
 
             messages.append({"role": "user", "content": user_input})
+            session_id = save_history(messages, session_id)
             while True:
                 messages, tokens, limit = compact_context(messages, p_model)
                 console.print(Align.right(Text(f"Context: {(tokens*100)//limit}%", style="dim")))
                 reply = call_model(p_name, p_model, key, messages)
-                messages.append({"role": "assistant", "content": reply})
+
+                # ====== NEW LOGIC: Assistant message → tool call (tool JSON not stored in history) ======
                 reasoning, tool_call = extract_json(reply)
-                if reasoning.strip(): console.print(Panel(reasoning, style="cyan", title="OpenCLI 💭"))
+
+                # If the model included normal text, show it and store it
+                if reasoning.strip():
+                    console.print(Panel(reasoning, style="cyan", title="OpenCLI 💭"))
+                    messages.append({"role": "assistant", "content": reasoning})
+                    session_id = save_history(messages, session_id)
+
+                # If a tool call was requested, handle it separately
                 if tool_call:
                     t_name, args = tool_call["tool"], tool_call.get("args", {})
+
                     if t_name not in TOOLS:
-                        messages.append({"role": "user", "content": f"Error: Tool {t_name} not found."})
-                        continue
-                    if mode == "safe" and Prompt.ask(f"Approve {t_name}?", default="n") != "y":
-                        messages.append({"role": "user", "content": "Denied."}); continue
+                        err_msg = f"Error: Tool {t_name} not found."
+                        console.print(Panel(err_msg, style="bold red"))
+                        messages.append({"role": "assistant", "content": err_msg})
+                        session_id = save_history(messages, session_id)
+                        break
+
+                    approval = Prompt.ask(f"Approve {t_name}? [y/N]", choices=["y","n"], default="n", show_default=False)
+
+                    if mode == "safe" and approval != "y":
+                        console.print(
+                            Panel(
+                                "Tool execution denied.\n\nWhat would you like the agent to do instead?",
+                                title="Denied",
+                                style="yellow"
+                            )
+                        )
+                        session_id = save_history(messages, session_id)
+                        break
+
                     try:
-                        res = TOOLS[t_name](**args)
-                        console.print(Panel(str(res)[:500] + ("..." if len(str(res))>500 else ""), title=f"Tool: {t_name}"))
-                        messages.append({"role": "user", "content": f"RESULT: {res}"})
-                    except TypeError as e:
-                        err_msg = f"Error: Tool '{t_name}' call failed due to incorrect arguments: {str(e)}. Please ensure all required arguments (like 'content' for 'write_file') are provided."
-                        console.print(Panel(err_msg, title="Tool Error", style="bold red"))
-                        messages.append({"role": "user", "content": err_msg})
+                        result = TOOLS[t_name](**args)
+                        console.print(Panel(str(result)[:500] + ("..." if len(str(result)) > 500 else ""), title=f"Tool: {t_name}"))
+
+                        # Feed tool result back into conversation
+                        messages.append({"role": "user", "content": f"RESULT: {result}"})
+                        session_id = save_history(messages, session_id)
+
+                        # Continue loop so model decides next step
+                        continue
+
                     except Exception as e:
                         err_msg = f"Error executing tool '{t_name}': {str(e)}"
                         console.print(Panel(err_msg, title="Tool Error", style="bold red"))
-                        messages.append({"role": "user", "content": err_msg})
-                    session_id = save_history(messages, session_id)
-                    continue
-                session_id = save_history(messages, session_id)
+                        messages.append({"role": "assistant", "content": err_msg})
+                        session_id = save_history(messages, session_id)
+                        break
+                # If no tool call, finish the loop (after showing/storing reasoning if any)
                 break
         except KeyboardInterrupt:
-            if Prompt.ask("Quit?", choices=["y","n"], default="n") == "y": break
+            quit_choice = Prompt.ask("Quit? [y/N]", choices=["y","n"], default="n", show_default=False)
+            if quit_choice == "y":
+                session_id = save_history(messages, session_id)
+                break
             banner(mode, config.get("model"))
 
 if __name__ == "__main__":
