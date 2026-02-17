@@ -333,6 +333,22 @@ def get_theme_color(color_name):
   }
   return colors.get(theme, colors["dark"]).get(color_name, "white")
 
+def cycle_mode(current_mode):
+  """Cycle through modes: SAFE -> UNSAFE -> PLAN -> SAFE"""
+  modes = ["safe", "unsafe", "plan"]
+  current_index = modes.index(current_mode) if current_mode in modes else 0
+  next_index = (current_index + 1) % len(modes)
+  return modes[next_index]
+
+def get_mode_indicator(mode):
+  """Get styled mode indicator for display"""
+  if mode == "safe":
+    return "[green]SAFE[/green]"
+  elif mode == "unsafe":
+    return "[red]UNSAFE[/red]"
+  else:  # plan
+    return "[dark_green]PLAN[/dark_green]"
+
 def banner(mode, model):
   console.clear()
 
@@ -1060,7 +1076,7 @@ def get_tool_approval(tool_name, args, mode, plan_mode=False):
     )
 
     # Show instructions
-    instructions = "[bold green]y[/bold green] approve • [bold red]n[/bold red] deny • [bold]Shift+Tab[/bold] toggle mode"
+    instructions = "[bold green]y[/bold green] approve • [bold red]n[/bold red] deny • [bold]Shift+Tab[/bold] cycle mode"
     console.print(instructions, justify="center")
 
     # Get response (supports mode toggle)
@@ -1259,14 +1275,19 @@ def get_multiline_input(prompt="› "):
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.keys import Keys
 
-    # Custom key bindings for proper Enter behavior
+    # Custom key bindings
     kb = KeyBindings()
 
-    @kb.add(Keys.ControlJ) # Enter
+    @kb.add(Keys.Enter)  # Plain Enter sends
     def _(event):
-      """Accept input on Ctrl+J (Enter)"""
+      """Accept input on Enter"""
       event.current_buffer.validate_and_set()
       event.app.exit()
+
+    @kb.add(Keys.ControlShiftEnter)  # Shift+Enter for newline
+    def _(event):
+      """Insert newline on Shift+Enter"""
+      event.current_buffer.insert_text('\n')
 
     @kb.add(Keys.Escape)
     def _(event):
@@ -1412,10 +1433,15 @@ def main():
         return
 
       text_c = get_theme_color("text")
+
+      # Display mode indicator on left, commands on right
+      current_mode = config.get("mode", "safe")
+      mode_text = get_mode_indicator(current_mode)
       console.print(
         f"\n[bold {text_c}]You[/bold {text_c}] "
         "[dim](/ → settings • /resume → load chat • /clear → reset • exit → quit)[/dim]"
       )
+      console.print(f"{mode_text} [dim]Enter=send • Shift+Enter=newline • Shift+Tab=cycle mode[/dim]")
       user_input = get_multiline_input("› ")
 
       if user_input.strip() == "/":
@@ -1592,12 +1618,13 @@ def main():
               plan_mode=(mode == "plan")
             )
 
-            # Handle mode toggle (Shift+Tab)
+            # Handle mode toggle (Shift+Tab) - cycle through all modes
             if approval == 'toggle':
-              mode = "safe" if mode != "safe" else "unsafe"
+              mode = cycle_mode(mode)
               config["mode"] = mode
               save_config(config)
-              console.print(f"\n[green]Mode switched to: {mode.upper()}[/green]\n")
+              mode_display = get_mode_indicator(mode)
+              console.print(f"\n[green]Mode switched to: {mode_display}[/green]\n")
               banner(mode, config.get("model"))
               continue
 
