@@ -21,6 +21,29 @@ import time
 import select
 import tty
 import termios
+import base64
+import subprocess as sp
+from PIL import Image
+from io import BytesIO
+
+import signal
+import atexit
+
+# Global session tracking for graceful shutdown
+CURRENT_MESSAGES = None
+CURRENT_SESSION_ID = None
+
+def persist_session_on_exit():
+    global CURRENT_MESSAGES, CURRENT_SESSION_ID
+    if CURRENT_MESSAGES is not None:
+        try:
+            save_history(CURRENT_MESSAGES, CURRENT_SESSION_ID)
+        except:
+            pass
+
+def handle_termination(signum, frame):
+    persist_session_on_exit()
+    sys.exit(0)
 
 console = Console()
 
@@ -427,6 +450,83 @@ def interactive_settings_menu():
             console.print("[green]Mode updated.[/green]")
             continue
 
+        # Model selection (auto-fetch if supported)
+        if key == "model":
+            provider = config.get("provider")
+
+            def fetch_models():
+                try:
+                    if provider == "OpenRouter":
+                        headers = {"Authorization": f"Bearer {config.get('openrouter_key')}"}
+                        r = requests.get("https://openrouter.ai/api/v1/models", headers=headers, timeout=10)
+                        data = r.json().get("data", [])
+                        return [m["id"] for m in data if "free" in m["id"]][:30]
+
+                    if provider == "Google":
+                        key = config.get("google_key")
+                        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={key}"
+                        r = requests.get(url, timeout=10)
+                        models = r.json().get("models", [])
+                        return [
+                            m["name"].replace("models/", "")
+                            for m in models
+                            if "generateContent" in m.get("supportedGenerationMethods", [])
+                        ][:20]
+
+                    if provider == "OpenAI":
+                        headers = {"Authorization": f"Bearer {config.get('openai_key')}"}
+                        r = requests.get("https://api.openai.com/v1/models", headers=headers, timeout=10)
+                        models = r.json().get("data", [])
+                        return [m["id"] for m in models if "gpt" in m["id"]][:20]
+
+                    if provider == "NVIDIA":
+                        return ["moonshotai/kimi-k2.5"]
+
+                    if provider == "Anthropic":
+                        # Curated up-to-date Anthropic model list (Haiku → Sonnet → Opus)
+                        return [
+                            # Haiku (fast / cost-efficient)
+                            "claude-haiku-4-5-20251001",
+
+                            # Sonnet (balanced reasoning / coding)
+                            "claude-sonnet-4-5-20250929",
+
+                            # Opus (highest capability)
+                            "claude-opus-4-6"
+                        ]
+
+                    if provider == "Ollama":
+                        return ["llama3", "mistral", "codellama"]
+
+                except Exception:
+                    return []
+
+            console.print("\nFetching available models...\n")
+            models = fetch_models()
+
+            if models:
+                for i, m in enumerate(models, 1):
+                    console.print(f"[cyan]{i}.[/cyan] {m}")
+                console.print("[cyan]M.[/cyan] Manual entry")
+                choice = console.input("› ").strip()
+
+                if choice.lower() == "m":
+                    manual = console.input("Enter model name: ").strip()
+                    if manual:
+                        config["model"] = manual
+                elif choice.isdigit() and 1 <= int(choice) <= len(models):
+                    config["model"] = models[int(choice) - 1]
+                save_config(config)
+                console.print("[green]Model updated.[/green]")
+            else:
+                console.print("[yellow]Could not fetch models. Manual entry required.[/yellow]")
+                manual = console.input("Enter model name: ").strip()
+                if manual:
+                    config["model"] = manual
+                    save_config(config)
+                    console.print("[green]Model updated.[/green]")
+            continue
+
         new_val = console.input(f"New value for {name} (leave blank to cancel): ").strip()
         if new_val:
             config[key] = new_val
@@ -456,9 +556,44 @@ def list_files(path="."):
     except Exception as e:
         return f"Error: {str(e)}"
 
-def read_file(path):
-    if not os.path.exists(path): return "File not found."
-    with open(path, "r") as f: return f.read()
+def read_file(path, offset=None, limit=None):
+    """
+    Read a file. Supports optional offset (line number) and limit (number of lines)
+    for partial reads. Fully backward compatible with old calls.
+    """
+    if not os.path.exists(path):
+        return "File not found."
+
+    try:
+        with open(path, "r") as f:
+            lines = f.readlines()
+
+        # Normalize offset
+        if offset is not None:
+            try:
+                offset = int(offset)
+            except:
+                offset = 0
+        else:
+            offset = 0
+
+        # Normalize limit
+        if limit is not None:
+            try:
+                limit = int(limit)
+            except:
+                limit = None
+
+        # Slice safely
+        if limit is not None:
+            sliced = lines[offset:offset + limit]
+        else:
+            sliced = lines[offset:]
+
+        return "".join(sliced)
+
+    except Exception as e:
+        return f"Error reading file: {str(e)}"
 
 def write_file(path, content):
     with open(path, "w") as f: f.write(content)
@@ -505,6 +640,17 @@ TOOLS = {
     "run_shell": run_shell
 }
 
+# Helper to truncate tool output for context safety
+def truncate_tool_output(output, limit=2000):
+    """
+    Truncate tool output before storing in conversation history
+    to prevent token explosion.
+    """
+    text = str(output)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n\n... (truncated for context safety)"
+
 import re
 
 # =====================================================
@@ -533,6 +679,28 @@ After a tool result is returned, you may respond normally.
 
 Never simulate tool execution.
 Never describe a tool call — only emit valid JSON.
+
+=== CODE MODIFICATION RULES (REPLACE_TEXT FIRST POLICY) ===
+When modifying code:
+- ALWAYS prefer `replace_text` over `write_file`.
+- Treat `write_file` as a LAST RESORT.
+- If a file already exists, you MUST attempt `replace_text` first.
+- Only use `write_file` when:
+  1. Creating a completely new file, OR
+  2. The user explicitly says: "rewrite the entire file".
+
+Before calling a modification tool, you MUST:
+1. Clearly state the file path.
+2. State whether this is an insertion or replacement.
+3. Show the exact snippet being replaced.
+4. Show the exact new snippet being inserted.
+5. Keep changes minimal and surgical.
+
+Never rewrite entire files for small changes.
+Never regenerate large unchanged sections.
+Minimize token usage and preserve existing structure.
+
+If unsure whether a full rewrite is necessary, default to `replace_text`.
 """
 
 def extract_json(text):
@@ -632,6 +800,15 @@ def check_ollama(url):
 
 def call_model(provider_name, provider_model, key, messages):
     headers = {"Content-Type": "application/json"}
+    # --- SANITIZE MESSAGES (fix Anthropic trailing whitespace error) ---
+    sanitized_messages = []
+    for m in messages:
+        sanitized = m.copy()
+        if isinstance(sanitized.get("content"), str):
+            sanitized["content"] = sanitized["content"].rstrip()
+        sanitized_messages.append(sanitized)
+
+    messages = sanitized_messages
     if provider_name == "OpenRouter": url = "https://openrouter.ai/api/v1/chat/completions"
     elif provider_name == "Anthropic": url = "https://api.anthropic.com/v1/messages"
     elif provider_name == "Google": url = "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -686,10 +863,29 @@ def call_model(provider_name, provider_model, key, messages):
         with Live(Spinner("dots", text="Thinking..."), refresh_per_second=12):
             response = requests.post(url, headers=headers, json=payload, stream=True, timeout=60)
             if response.status_code != 200:
-                try:
-                    return f"[red]API Error ({response.status_code}): {response.text}[/red]"
-                except Exception:
-                    return f"[red]API Error ({response.status_code}): Unknown response[/red]"
+                # Anthropic fallback logic for outdated model strings
+                if provider_name == "Anthropic" and response.status_code == 404:
+                    fallback_map = {
+                        "claude-haiku-4-5-20251001": "claude-haiku-4-5",
+                        "claude-sonnet-4-5-20250929": "claude-sonnet-4-5",
+                        "claude-opus-4-6": "claude-opus-4-6"
+                    }
+
+                    fallback_model = fallback_map.get(provider_model)
+                    if fallback_model and fallback_model != provider_model:
+                        payload["model"] = fallback_model
+                        retry = requests.post(url, headers=headers, json=payload, stream=True, timeout=60)
+                        if retry.status_code == 200:
+                            response = retry
+                        else:
+                            return f"[red]API Error ({retry.status_code}): {retry.text}[/red]"
+                    else:
+                        return f"[red]API Error ({response.status_code}): {response.text}[/red]"
+                else:
+                    try:
+                        return f"[red]API Error ({response.status_code}): {response.text}[/red]"
+                    except Exception:
+                        return f"[red]API Error ({response.status_code}): Unknown response[/red]"
 
             for line in response.iter_lines():
                 if check_stop(): break
@@ -805,11 +1001,22 @@ def main():
     session_id = None
     resumed = False
 
+    global CURRENT_MESSAGES, CURRENT_SESSION_ID
+    CURRENT_MESSAGES = messages
+    CURRENT_SESSION_ID = session_id
+
+    # Register graceful shutdown handlers
+    signal.signal(signal.SIGTERM, handle_termination)
+    signal.signal(signal.SIGHUP, handle_termination)
+    atexit.register(persist_session_on_exit)
+
     if "--resume" in sys.argv:
         sel = select_session_menu()
         if sel:
             messages = sel["messages"]
             session_id = sel["id"]
+            CURRENT_MESSAGES = messages
+            CURRENT_SESSION_ID = session_id
             resumed = True
             console.print(f"[dim]📜 Resumed: {sel['title']}[/dim]")
             time.sleep(1)
@@ -835,13 +1042,17 @@ def main():
             elif m["role"] == "user":
                 console.print(f"[bold {get_theme_color('text')}]You[/bold {get_theme_color('text')}] › {m['content']}")
 
-    # Only inject PROJECT context for new sessions
+    # Lightweight project context (no full directory dump)
     if not resumed:
         cwd = os.getcwd()
-        files_list = list_files(".")
         messages.append({
             "role": "system",
-            "content": f"PROJECT: {cwd}\nFILES:\n{files_list}"
+            "content": (
+                f"WORKING_DIRECTORY: {cwd}\n"
+                "You may use tools like list_files, read_file, and search_code "
+                "to explore the project as needed.\n"
+                "Do NOT assume full project knowledge without using tools."
+            )
         })
     
     mode = config.get("mode", "safe")
@@ -884,6 +1095,8 @@ def main():
                 if sel:
                     messages = sel["messages"]
                     session_id = sel["id"]
+                    CURRENT_MESSAGES = messages
+                    CURRENT_SESSION_ID = session_id
                     banner(config.get("mode", "safe"), config.get("model"))
 
                     total_msgs = len(messages)
@@ -906,19 +1119,26 @@ def main():
             if user_input.strip() == "/clear":
                 messages = [{"role": "system", "content": SYSTEM_PROMPT}]
                 session_id = None
+                CURRENT_MESSAGES = messages
+                CURRENT_SESSION_ID = session_id
                 console.clear()
                 config = load_config()
                 banner(config.get("mode", "safe"), config.get("model"))
                 continue
             if user_input.lower() in ["exit", "quit"]:
                 session_id = save_history(messages, session_id)
+                CURRENT_MESSAGES = messages
+                CURRENT_SESSION_ID = session_id
                 break
 
             messages.append({"role": "user", "content": user_input})
             session_id = save_history(messages, session_id)
+            CURRENT_MESSAGES = messages
+            CURRENT_SESSION_ID = session_id
+            # Initial compaction per user turn
+            messages, tokens, limit = compact_context(messages, p_model)
+            console.print(Align.right(Text(f"Context: {(tokens*100)//limit}%", style="dim")))
             while True:
-                messages, tokens, limit = compact_context(messages, p_model)
-                console.print(Align.right(Text(f"Context: {(tokens*100)//limit}%", style="dim")))
                 reply = call_model(p_name, p_model, key, messages)
 
                 # ====== NEW LOGIC: Assistant message → tool call (tool JSON not stored in history) ======
@@ -944,6 +1164,8 @@ def main():
                     )
                     messages.append({"role": "assistant", "content": reasoning})
                     session_id = save_history(messages, session_id)
+                    CURRENT_MESSAGES = messages
+                    CURRENT_SESSION_ID = session_id
 
                 # If a tool call was requested, handle it separately
                 if tool_call:
@@ -954,6 +1176,8 @@ def main():
                         console.print(Panel(err_msg, style="bold red"))
                         messages.append({"role": "assistant", "content": err_msg})
                         session_id = save_history(messages, session_id)
+                        CURRENT_MESSAGES = messages
+                        CURRENT_SESSION_ID = session_id
                         break
 
                     approval = Prompt.ask(f"Approve {t_name}? [y/N]", choices=["y","n"], default="n", show_default=False)
@@ -967,6 +1191,8 @@ def main():
                             )
                         )
                         session_id = save_history(messages, session_id)
+                        CURRENT_MESSAGES = messages
+                        CURRENT_SESSION_ID = session_id
                         break
 
                     try:
@@ -978,31 +1204,68 @@ def main():
                             + (f" [dim]({arg_preview})[/dim]" if arg_preview else "")
                         )
 
-                        # Append structured tool result (do NOT trigger immediate model recall)
-                        messages.append({
-                            "role": "tool",
-                            "name": t_name,
-                            "content": str(result)
-                        })
+                        truncated = truncate_tool_output(result)
+
+                        # Append structured tool result (Anthropic does NOT support role="tool")
+                        if p_name == "Anthropic":
+                            messages.append({
+                                "role": "assistant",
+                                "content": f"[Tool Result: {t_name}]\n{truncated}"
+                            })
+                        else:
+                            messages.append({
+                                "role": "tool",
+                                "name": t_name,
+                                "content": truncated
+                            })
 
                         session_id = save_history(messages, session_id)
+                        CURRENT_MESSAGES = messages
+                        CURRENT_SESSION_ID = session_id
 
-                        # Break inner loop so we return to outer loop
-                        # and bundle tool results into next single model call
-                        break
+                        # Re-compact after tool output before next model call
+                        messages, tokens, limit = compact_context(messages, p_model)
+                        console.print(Align.right(Text(f"Context: {(tokens*100)//limit}%", style="dim")))
+
+                        continue
 
                     except Exception as e:
                         err_msg = f"Error executing tool '{t_name}': {str(e)}"
                         console.print(Panel(err_msg, title="Tool Error", style="bold red"))
-                        messages.append({"role": "assistant", "content": err_msg})
+
+                        # Feed tool failure back to model so it can retry or adjust
+                        error_text = f"Tool failed with error: {str(e)}"
+                        truncated_error = truncate_tool_output(error_text, limit=1000)
+
+                        if p_name == "Anthropic":
+                            messages.append({
+                                "role": "assistant",
+                                "content": f"[Tool Error: {t_name}]\n{truncated_error}"
+                            })
+                        else:
+                            messages.append({
+                                "role": "tool",
+                                "name": t_name,
+                                "content": truncated_error
+                            })
+
                         session_id = save_history(messages, session_id)
-                        break
+                        CURRENT_MESSAGES = messages
+                        CURRENT_SESSION_ID = session_id
+
+                        # Re-compact after tool error before retry
+                        messages, tokens, limit = compact_context(messages, p_model)
+                        console.print(Align.right(Text(f"Context: {(tokens*100)//limit}%", style="dim")))
+
+                        continue
                 # If no tool call, finish the loop (after showing/storing reasoning if any)
                 break
         except KeyboardInterrupt:
             quit_choice = Prompt.ask("Quit? [y/N]", choices=["y","n"], default="n", show_default=False)
             if quit_choice == "y":
                 session_id = save_history(messages, session_id)
+                CURRENT_MESSAGES = messages
+                CURRENT_SESSION_ID = session_id
                 break
             banner(mode, config.get("model"))
 
