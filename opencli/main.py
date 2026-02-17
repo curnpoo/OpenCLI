@@ -1270,7 +1270,7 @@ def call_model(provider_name, provider_model, key, messages):
   except Exception as e: return f"[red]Error: {str(e)}[/red]"
 
 def get_multiline_input(prompt="› "):
-  """Multi-line input: Enter to send, Shift+Enter for newline, Shift+Tab to cycle mode."""
+  """Multi-line input: Enter to send, Ctrl+Enter for newline, Shift+Tab to cycle mode."""
   if HAS_PROMPT_TOOLKIT:
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.keys import Keys
@@ -1284,9 +1284,9 @@ def get_multiline_input(prompt="› "):
       event.current_buffer.validate_and_set()
       event.app.exit()
 
-    @kb.add(Keys.ControlShiftEnter)  # Shift+Enter for newline
+    @kb.add(Keys.ControlEnter)  # Ctrl+Enter for newline
     def _(event):
-      """Insert newline on Shift+Enter"""
+      """Insert newline on Ctrl+Enter"""
       event.current_buffer.insert_text('\n')
 
     @kb.add(Keys.ShiftTab)  # Shift+Tab to cycle modes
@@ -1449,7 +1449,7 @@ def main():
         f"\n[bold {text_c}]You[/bold {text_c}] "
         "[dim](/ → settings • /resume → load chat • /clear → reset • exit → quit)[/dim]"
       )
-      console.print(f"{mode_text} [dim]Enter=send • Shift+Enter=newline • Shift+Tab=cycle mode[/dim]")
+      console.print(f"{mode_text} [dim]Enter=send • Ctrl+Enter=newline • Shift+Tab=cycle mode[/dim]")
 
       # Get input with mode cycling support
       while True:
@@ -1463,7 +1463,7 @@ def main():
           mode_text = get_mode_indicator(mode)
           console.print(f"\n{mode_text} Mode changed\n")
           # Show mode indicator again and re-prompt
-          console.print(f"{mode_text} [dim]Enter=send • Shift+Enter=newline • Shift+Tab=cycle mode[/dim]")
+          console.print(f"{mode_text} [dim]Enter=send • Ctrl+Enter=newline • Shift+Tab=cycle mode[/dim]")
           continue
         break
 
