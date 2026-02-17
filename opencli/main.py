@@ -935,21 +935,6 @@ def main():
                     except:
                         pass
 
-                # Require planning text before first tool in a turn
-                if tool_call and not reasoning.strip():
-                    console.print(
-                        Panel(
-                            "Model attempted tool call without plan.\n\nRequesting planning step first.",
-                            style="yellow",
-                            title="Plan Required"
-                        )
-                    )
-                    messages.append({
-                        "role": "assistant",
-                        "content": "Please describe your plan before using tools."
-                    })
-                    session_id = save_history(messages, session_id)
-                    break
 
                 # If the model included normal text, show it and store it
                 if reasoning.strip():
@@ -986,15 +971,11 @@ def main():
 
                     try:
                         result = TOOLS[t_name](**args)
-                        truncated = str(result)
-                        if len(truncated) > 300:
-                            truncated = truncated[:300] + "\n\n[dim]... output truncated ...[/dim]"
+                        # Show compact one-line tool usage (no full dump)
+                        arg_preview = ", ".join(f"{k}={v}" for k, v in args.items())
                         console.print(
-                            Panel(
-                                truncated,
-                                title=f"Tool: {t_name}",
-                                border_style="green"
-                            )
+                            f"[green]Tool:[/green] {t_name}"
+                            + (f" [dim]({arg_preview})[/dim]" if arg_preview else "")
                         )
 
                         # Append structured tool result (do NOT trigger immediate model recall)
