@@ -1271,7 +1271,8 @@ def call_model(provider_name, provider_model, key, messages):
 
 def get_multiline_input(prompt="› "):
   """Input handler: Enter to send, Shift+Tab to cycle mode."""
-  console.print(f"[bold {get_theme_color('text')}]{prompt}[/bold {get_theme_color('text')}]", end="", flush=True)
+  console.print(f"[bold {get_theme_color('text')}]{prompt}[/bold {get_theme_color('text')}]", end="")
+  sys.stdout.flush()
 
   fd = sys.stdin.fileno()
   old_settings = termios.tcgetattr(fd)
