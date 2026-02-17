@@ -28,8 +28,17 @@ from io import BytesIO
 
 import signal
 import atexit
+from filelock import FileLock
+import uuid
+import time as time_module
 
-# Global session tracking for graceful shutdown
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.enums import EditingMode
+    HAS_PROMPT_TOOLKIT = True
+except ImportError:
+    HAS_PROMPT_TOOLKIT = False
+
 CURRENT_MESSAGES = None
 CURRENT_SESSION_ID = None
 
@@ -47,15 +56,12 @@ def handle_termination(signum, frame):
 
 console = Console()
 
-# =====================================================
-# CONFIG SYSTEM
-# =====================================================
 
 CONFIG_PATH = Path.home() / ".opencli"
 CONFIG_FILE = CONFIG_PATH / "config.json"
 HISTORY_FILE = CONFIG_PATH / "history.json"
+SESSIONS_DIR = CONFIG_PATH / "sessions"
 
-# Approx token context windows for models
 CONTEXT_WINDOWS = {
     "claude-3-5-sonnet-20240620": 200000,
     "claude-5-sonnet-20260203": 200000,
@@ -70,7 +76,6 @@ CONTEXT_WINDOWS = {
 }
 
 def get_context_limit(model_name):
-    """Detects context limit based on model name keywords."""
     model_lower = model_name.lower()
     if model_name in CONTEXT_WINDOWS:
         return CONTEXT_WINDOWS[model_name]
@@ -85,17 +90,39 @@ def get_context_limit(model_name):
     
     return 128000 # Default fallback
 
+def format_time(seconds):
+    """Convert seconds to readable format (1.2s, 45ms, etc)."""
+    if seconds >= 1:
+        return f"{seconds:.1f}s"
+    else:
+        return f"{int(seconds * 1000)}ms"
+
+def format_tokens(count):
+    """Format token count with commas."""
+    return f"{count:,}" if count > 999 else str(count)
+
 def count_tokens(messages):
-    """Rough character-based token approximation (1 token ~= 4 chars)."""
-    text = ""
+    """
+    Better token approximation:
+    - English text: ~1 token per 4 chars
+    - Code: ~1 token per 3 chars (more dense)
+    - JSON: ~1 token per 3 chars
+    """
+    total = 0
     for m in messages:
-        text += m.get("content", "")
-    return len(text) // 4
+        content = m.get("content", "")
+        # Heuristic: check if content looks like code/JSON
+        if any(x in content for x in ['{', '}', 'def ', 'class ', 'function', 'const ']):
+            # Code-like content
+            total += len(content) // 3
+        else:
+            # Natural language
+            total += len(content) // 4
+    return total
 
 def compact_context(messages, model_name):
     """Prunes history if context usage exceeds threshold."""
     limit = get_context_limit(model_name)
-    # Default to 75% if not set or invalid
     try:
         threshold_pct = int(config.get("compaction_threshold", 75))
     except:
@@ -107,82 +134,88 @@ def compact_context(messages, model_name):
     if current_tokens < threshold:
         return messages, current_tokens, limit
     
-    # Keep system messages
     system_msgs = [m for m in messages if m["role"] == "system"]
     other_msgs = [m for m in messages if m["role"] != "system"]
     
-    # We prune from the beginning of 'other_msgs', keeping pairs (user + assistant)
-    # until we are below the threshold. We try to keep at least the last 2 pairs if possible.
     while count_tokens(system_msgs + other_msgs) > threshold and len(other_msgs) > 4:
-        # Remove the oldest pair
         other_msgs = other_msgs[2:]
         
     compacted = system_msgs + other_msgs
     tokens_after = count_tokens(compacted)
     return compacted, tokens_after, limit
 
-def load_history():
-    if not HISTORY_FILE.exists():
-        return {"sessions": []}
-    try:
-        with open(HISTORY_FILE, "r") as f:
-            data = json.load(f)
-            # Filter out sessions older than 24 hours
-            now = time.time()
-            data["sessions"] = [s for s in data["sessions"] if now - s.get("timestamp", 0) < 86400]
-            return data
-    except:
-        return {"sessions": []}
-
 def save_history(messages, session_id=None):
     CONFIG_PATH.mkdir(exist_ok=True)
-    history = load_history()
+    SESSIONS_DIR.mkdir(exist_ok=True)
+
+    if not session_id:
+        session_id = str(uuid.uuid4())
+
+    session_file = SESSIONS_DIR / f"{session_id}.json"
+    lock = FileLock(str(session_file) + ".lock")
+
     cwd = os.getcwd()
-    
-    # Generate title from first user message
+
     title = "New Chat"
     for m in messages:
-        if m["role"] == "user":
-            content = m["content"].strip().splitlines()[0]
+        if m.get("role") == "user":
+            content = m.get("content", "").strip().splitlines()[0]
             title = (content[:40] + "...") if len(content) > 40 else content
             break
 
     session_data = {
-        "id": session_id or str(time.time()),
+        "id": session_id,
         "timestamp": time.time(),
         "title": title,
         "cwd": cwd,
         "messages": messages
     }
 
-    # Update existing or add new
-    found = False
-    for i, s in enumerate(history["sessions"]):
-        if s["id"] == session_data["id"]:
-            history["sessions"][i] = session_data
-            found = True
-            break
-    
-    if not found:
-        history["sessions"].insert(0, session_data)
-    
-    # Keep only last 10 (increased for project awareness)
-    history["sessions"] = history["sessions"][:10]
-    
     try:
-        with open(HISTORY_FILE, "w") as f:
-            json.dump(history, f)
+        with lock:
+            with open(session_file, "w") as f:
+                json.dump(session_data, f)
     except:
         pass
-    return session_data["id"]
+
+    return session_id
+
+
+def load_history():
+    CONFIG_PATH.mkdir(exist_ok=True)
+    SESSIONS_DIR.mkdir(exist_ok=True)
+
+    sessions = []
+
+    if HISTORY_FILE.exists():
+        try:
+            with open(HISTORY_FILE, "r") as f:
+                legacy = json.load(f)
+                sessions.extend(legacy.get("sessions", []))
+        except:
+            pass
+
+    for file in SESSIONS_DIR.glob("*.json"):
+        try:
+            lock = FileLock(str(file) + ".lock")
+            with lock:
+                with open(file, "r") as f:
+                    data = json.load(f)
+                    sessions.append(data)
+        except:
+            continue
+
+    now = time.time()
+    sessions = [s for s in sessions if now - s.get("timestamp", 0) < 86400]
+
+    sessions.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+
+    return {"sessions": sessions[:10]}
 
 def get_char(fd):
-    """Read full escape sequences safely (fix arrow keys exiting)."""
     ch = sys.stdin.read(1)
-
-    if ch == '\x1b':  # ESC
+    if ch == '\x1b':
         seq = ch
-        # Try to read the rest of the escape sequence
         for _ in range(2):
             r, _, _ = select.select([fd], [], [], 0.05)
             if r:
@@ -204,11 +237,11 @@ def select_session_menu():
     cwd = os.getcwd()
 
     if not sessions:
-        console.print(Panel("No recent sessions found.", style="yellow"))
+        console.print(Panel("No recent sessions found.", style="dim"))
         console.input("Press Enter to return...")
         return None
 
-    console.print(Panel("[bold cyan]Resume Recent Chat[/bold cyan]", border_style="cyan"))
+    console.print(Panel("[bold green]Resume Recent Chat[/bold green]", border_style="green"))
 
     while True:
         console.print()
@@ -216,7 +249,7 @@ def select_session_menu():
             is_local = s.get("cwd") == cwd
             tag = "[dim](here)[/dim] " if is_local else ""
             dt = time.strftime("%H:%M", time.localtime(s["timestamp"]))
-            console.print(f"[cyan]{i}.[/cyan] {tag}{s['title']} [dim]({dt})[/dim]")
+            console.print(f"[green]{i}.[/green] {tag}{s['title']} [dim]({dt})[/dim]")
 
         console.print("\n[dim]Enter number to resume • q to cancel[/dim]")
         choice = console.input("› ").strip()
@@ -236,7 +269,7 @@ def load_config():
         "openai_key": "",
         "google_key": "",
         "ollama_url": "http://localhost:11434/v1/chat/completions",
-        "mode": "safe",
+        "mode": "safe",  # safe, unsafe, or plan
         "provider": "OpenRouter",
         "url": "https://openrouter.ai/api/v1/chat/completions",
         "theme": "dark",
@@ -277,25 +310,22 @@ def save_config(config):
 
 config = load_config()
 
-# =====================================================
-# BANNER
-# =====================================================
 
 def get_theme_color(color_name):
     theme = config.get("theme", "dark")
     colors = {
         "dark": {
-            "primary": "cyan",
-            "secondary": "green",
-            "warning": "yellow",
+            "primary": "green",
+            "secondary": "dark_green",
+            "warning": "red",
             "error": "red",
             "text": "white",
             "dim": "dim"
         },
         "light": {
-            "primary": "blue",
+            "primary": "green",
             "secondary": "dark_green",
-            "warning": "dark_orange",
+            "warning": "red",
             "error": "red",
             "text": "black",
             "dim": "dim"
@@ -336,8 +366,8 @@ def banner(mode, model):
         ("\n- by curren -\n", "dim"),
         (f"\nFolder: {cwd}", "green"),
         (f"\nModel:  {model}", "green"),
-        (f"\nMode:   {mode.upper()}\n", "bold yellow" if mode == "safe" else "bold red"),
-        ("\nTip: SAFE mode asks before tools • UNSAFE auto-runs.\n", "dim")
+        (f"\nMode:   {mode.upper()}\n", "bold green"),
+        ("\nTip: SAFE asks before tools • UNSAFE auto-runs • PLAN reads & analyzes\n", "dim")
     )
 
     from rich.columns import Columns
@@ -360,13 +390,10 @@ def banner(mode, model):
         )
     )
 
-# =====================================================
-# SETTINGS
-# =====================================================
 
 def interactive_settings_menu():
     console.clear()
-    console.print(Panel("[bold cyan]OpenCLI Settings[/bold cyan]", border_style="cyan"))
+    console.print(Panel("[bold green]OpenCLI Settings[/bold green]", border_style="green"))
 
     options = [
         ("Provider", "provider"),
@@ -389,7 +416,7 @@ def interactive_settings_menu():
             value = str(config.get(key, ""))
             if "key" in key and value:
                 value = value[:4] + "..." + value[-4:]
-            console.print(f"[cyan]{i}.[/cyan] {name}: [green]{value if value else 'EMPTY'}[/green]")
+            console.print(f"[green]{i}.[/green] {name}: [green]{value if value else 'EMPTY'}[/green]")
 
         console.print("\n[dim]Enter number to edit • q to exit[/dim]")
         choice = console.input("› ").strip()
@@ -406,12 +433,11 @@ def interactive_settings_menu():
 
         name, key = options[idx]
 
-        # Provider selection (dropdown style)
         if key == "provider":
             console.print("\nSelect Provider:")
             providers = ["OpenRouter", "Anthropic", "Google", "OpenAI", "NVIDIA", "Ollama"]
             for i, p in enumerate(providers, 1):
-                console.print(f"[cyan]{i}.[/cyan] {p}")
+                console.print(f"[green]{i}.[/green] {p}")
             choice = console.input("› ").strip()
             if choice.isdigit() and 1 <= int(choice) <= len(providers):
                 new_provider = providers[int(choice) - 1]
@@ -422,11 +448,10 @@ def interactive_settings_menu():
                 console.print("[green]Provider updated.[/green]")
             continue
 
-        # Theme editing (dropdown style)
         if key == "theme":
             console.print("\nTheme Options:")
-            console.print("[cyan]1.[/cyan] dark")
-            console.print("[cyan]2.[/cyan] light")
+            console.print("[green]1.[/green] dark")
+            console.print("[green]2.[/green] light")
             t_choice = console.input("› ").strip()
             if t_choice == "1":
                 config["theme"] = "dark"
@@ -436,21 +461,22 @@ def interactive_settings_menu():
             console.print("[green]Theme updated.[/green]")
             continue
 
-        # Execution Mode editing (clarity)
         if key == "mode":
             console.print("\nExecution Mode:")
-            console.print("[cyan]1.[/cyan] SAFE  (approval required before tools)")
-            console.print("[cyan]2.[/cyan] UNSAFE (auto-executes tools — dangerous)")
+            console.print("[green]1.[/green] SAFE   (requires approval for each tool)")
+            console.print("[green]2.[/green] UNSAFE (auto-executes tools without asking)")
+            console.print("[green]3.[/green] PLAN   (reads only - analyzes and plans, never executes)")
             m_choice = console.input("› ").strip()
             if m_choice == "1":
                 config["mode"] = "safe"
             elif m_choice == "2":
                 config["mode"] = "unsafe"
+            elif m_choice == "3":
+                config["mode"] = "plan"
             save_config(config)
             console.print("[green]Mode updated.[/green]")
             continue
 
-        # Model selection (auto-fetch if supported)
         if key == "model":
             provider = config.get("provider")
 
@@ -506,8 +532,8 @@ def interactive_settings_menu():
 
             if models:
                 for i, m in enumerate(models, 1):
-                    console.print(f"[cyan]{i}.[/cyan] {m}")
-                console.print("[cyan]M.[/cyan] Manual entry")
+                    console.print(f"[green]{i}.[/green] {m}")
+                console.print("[green]M.[/green] Manual entry")
                 choice = console.input("› ").strip()
 
                 if choice.lower() == "m":
@@ -519,7 +545,7 @@ def interactive_settings_menu():
                 save_config(config)
                 console.print("[green]Model updated.[/green]")
             else:
-                console.print("[yellow]Could not fetch models. Manual entry required.[/yellow]")
+                console.print("[green]Could not fetch models. Manual entry required.[/green]")
                 manual = console.input("Enter model name: ").strip()
                 if manual:
                     config["model"] = manual
@@ -535,9 +561,6 @@ def interactive_settings_menu():
 
     console.clear()
 
-# =====================================================
-# TOOLS
-# =====================================================
 
 def list_files(path="."):
     import os
@@ -640,7 +663,33 @@ TOOLS = {
     "run_shell": run_shell
 }
 
-# Helper to truncate tool output for context safety
+TOOL_METADATA = {
+    "list_files": {
+        "description": "List files in a directory",
+        "destructive": False
+    },
+    "read_file": {
+        "description": "Read file contents (safe, read-only)",
+        "destructive": False
+    },
+    "write_file": {
+        "description": "Create or overwrite a file",
+        "destructive": True
+    },
+    "replace_text": {
+        "description": "Replace text in a file",
+        "destructive": True
+    },
+    "search_code": {
+        "description": "Search code with grep",
+        "destructive": False
+    },
+    "run_shell": {
+        "description": "Execute shell command",
+        "destructive": True
+    }
+}
+
 def truncate_tool_output(output, limit=2000):
     """
     Truncate tool output before storing in conversation history
@@ -651,20 +700,152 @@ def truncate_tool_output(output, limit=2000):
         return text
     return text[:limit] + "\n\n... (truncated for context safety)"
 
+def generate_unified_diff(file_path, old_content, new_content):
+    """Generate a unified diff between old and new content."""
+    old_lines = old_content.splitlines(keepends=True) if old_content else []
+    new_lines = new_content.splitlines(keepends=True) if new_content else []
+
+    diff = difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile=f"{file_path} (before)",
+        tofile=f"{file_path} (after)",
+        lineterm=''
+    )
+    return ''.join(diff)
+
+def show_tool_execution(tool_name, args, tool_func, plan_mode=False, modified_files=None):
+    """
+    Execute tool with Claude Code-like UX:
+    - Shows tool being called with spinner
+    - Displays file diffs for modifications
+    - Shows results inline (scrollable)
+    - Auto-collapses after completion
+
+    Returns: (result, display_panels, tool_result_text)
+    """
+    if plan_mode:
+        return None, "[dark_green]→ PLAN mode: tool skipped (learning & analyzing)[/dark_green]", None
+
+    # Show execution with spinner
+    arg_str = ", ".join([f"{k}={v}" for k, v in args.items()])
+    console.print()
+
+    try:
+        with console.status(f"[green]⚙ {tool_name}[/green] {arg_str}", spinner="dots"):
+            result = tool_func(**args)
+    except Exception as e:
+        error_msg = f"Error executing {tool_name}: {str(e)}"
+        console.print(Panel(f"[red]{error_msg}[/red]", title="⚠ Tool Error", border_style="red"))
+        return None, "", error_msg
+
+    result_text = str(result)
+    display_panels = []
+
+    # === FILE MODIFICATION HANDLING ===
+    if tool_name == "replace_text":
+        file_path = args.get("path", "?")
+        old_text = args.get("old_text", "")
+        new_text = args.get("new_text", "")
+
+        # Track modified file
+        if modified_files is not None:
+            modified_files.add(file_path)
+
+        # Show before/after diff
+        diff_content = f"""[bold green]{file_path}[/bold green]
+
+[bold red]REMOVED[/bold red]
+[red]{old_text}[/red]
+
+[bold green]ADDED[/bold green]
+[green]{new_text}[/green]"""
+
+        display_panels.append(
+            Panel(
+                diff_content,
+                title="[green]📝 Text Replaced[/green]",
+                border_style="green",
+                padding=(1, 2)
+            )
+        )
+
+    elif tool_name == "write_file":
+        file_path = args.get("path", "?")
+        content = args.get("content", "")
+        lines = len(content.splitlines())
+
+        # Track modified file
+        if modified_files is not None:
+            modified_files.add(file_path)
+
+        # Show file creation summary
+        preview = content[:200] + ("..." if len(content) > 200 else "")
+        display_panels.append(
+            Panel(
+                f"[green]✓ File created[/green]\n[dim]{file_path}[/dim]\n[dim]{lines} lines[/dim]\n\n[dim]{preview}[/dim]",
+                title="[green]📄 File Written[/green]",
+                border_style="green",
+                padding=(1, 2)
+            )
+        )
+
+    # === STANDARD OUTPUT ===
+    else:
+        # For read operations, show the output
+        if result_text.strip() and result_text not in ["(Command executed with no output)", "No files found."]:
+            truncated = truncate_tool_output(result_text, limit=1000)
+
+            # Format based on tool type
+            if tool_name == "list_files":
+                title = "📁 Files Found"
+                style = "green"
+            elif tool_name == "read_file":
+                title = "📖 File Contents"
+                style = "green"
+            elif tool_name == "search_code":
+                title = "🔍 Search Results"
+                style = "green"
+            else:
+                title = f"{tool_name} Output"
+                style = "green"
+
+            display_panels.append(
+                Panel(
+                    f"[dim]{truncated}[/dim]",
+                    title=f"[{style}]{title}[/{style}]",
+                    border_style=style,
+                    padding=(1, 2)
+                )
+            )
+
+    return result, display_panels, result_text
+
 import re
 
-# =====================================================
-# SYSTEM PROMPT
-# =====================================================
 
 def get_system_prompt():
     prompt_path = Path(__file__).parent / "OPENCLI.md"
     if prompt_path.exists():
-        with open(prompt_path, "r") as f: return f.read()
+        with open(prompt_path, "r") as f:
+            return f.read().strip()
     return "You are OpenCLI, an autonomous coding agent."
 
-SYSTEM_PROMPT = get_system_prompt() + """
 
+def build_system_prompt():
+    """
+    Build full system prompt dynamically:
+    - Always reload OPENCLI.md (session-level behavior)
+    - Always reload TOOLS.md (request-level tool awareness)
+    """
+    base = get_system_prompt()
+
+    tools_path = Path(__file__).parent / "TOOLS.md"
+    tools_text = ""
+    if tools_path.exists():
+        with open(tools_path, "r") as f:
+            tools_text = f.read().strip()
+
+    strict_rules = """
 === TOOL USAGE RULES (STRICT) ===
 When you decide to use a tool:
 - Output ONLY a single JSON object.
@@ -679,6 +860,14 @@ After a tool result is returned, you may respond normally.
 
 Never simulate tool execution.
 Never describe a tool call — only emit valid JSON.
+
+=== EXECUTION MODES ===
+The CLI has three modes:
+- SAFE: You will call tools, but the user must approve each one
+- UNSAFE: You will call tools and they auto-execute
+- PLAN: You should analyze code and PLAN your approach, but NOT call tools (read-only mode)
+
+In PLAN mode, inspect files and reason about what needs to be done, but do not attempt tool calls.
 
 === CODE MODIFICATION RULES (REPLACE_TEXT FIRST POLICY) ===
 When modifying code:
@@ -702,6 +891,8 @@ Minimize token usage and preserve existing structure.
 
 If unsure whether a full rewrite is necessary, default to `replace_text`.
 """
+
+    return f"{base}\n\n{tools_text}\n\n{strict_rules}"
 
 def extract_json(text):
     """
@@ -735,7 +926,6 @@ def extract_json(text):
     # No valid tool JSON found
     return cleaned, None
 
-# --- ADD A NORMALIZER FUNCTION ---
 def normalize_openai_tool_call(data):
     """
     Normalize OpenAI-style tool_calls or function_call into
@@ -787,9 +977,6 @@ def check_stop():
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
     return False
 
-# =====================================================
-# AGENT LOOP
-# =====================================================
 
 def check_ollama(url):
     try:
@@ -798,9 +985,117 @@ def check_ollama(url):
         return response.status_code == 200
     except: return False
 
+def get_tool_approval_key():
+    """Get single-key input: y/n/t (toggle mode) without requiring Enter."""
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1).lower()
+
+        # Check for Shift+Tab (ESC [ Z sequence)
+        if ch == '\x1b':  # ESC
+            try:
+                next_ch = sys.stdin.read(1)
+                if next_ch == '[':
+                    third_ch = sys.stdin.read(1)
+                    if third_ch == 'Z':  # Shift+Tab
+                        return 't'
+            except:
+                pass
+
+        # Single key presses
+        if ch in ['y', 'n']:
+            return ch
+        elif ch == '\r' or ch == '\n':
+            return 'n'  # Default to deny
+        elif ch == '\x03':  # Ctrl+C
+            raise KeyboardInterrupt
+        else:
+            return None  # Invalid key
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+def get_tool_approval(tool_name, args, mode, plan_mode=False):
+    """
+    Robust tool approval with metadata, single-key input, and mode toggle.
+    Returns: True (approve), False (deny), 'toggle' (switch modes), or 'skip' (plan mode).
+    """
+    metadata = TOOL_METADATA.get(tool_name, {})
+    description = metadata.get("description", "Unknown tool")
+    is_destructive = metadata.get("destructive", False)
+
+    # Build tool info display with description
+    args_display = "\n".join([f"  • {k}: {v}" for k, v in args.items()]) if args else "  (no args)"
+    destructive_badge = "[bold red]⚠ DESTRUCTIVE[/bold red] " if is_destructive else ""
+    tool_info = f"{destructive_badge}[bold green]{tool_name}[/bold green]\n[dim]{description}[/dim]\n\n{args_display}"
+
+    if plan_mode:
+        # PLAN mode: never execute, just show what would happen
+        console.print()
+        console.print(
+            Panel(
+                tool_info,
+                title="[bold dark_green]📋 PLAN MODE (Read-Only)[/bold dark_green]",
+                border_style="green",
+                padding=(1, 2)
+            )
+        )
+        console.print("[dark_green]→ Tool execution skipped (PLAN mode: learning & planning only)[/dark_green]")
+        return 'skip'
+
+    if mode == "safe":
+        # SAFE mode: ALWAYS show approval with metadata
+        console.print()
+        title = f"{'[bold red]⚠ DESTRUCTIVE[/bold red] ' if is_destructive else ''}[bold green]Approve?[/bold green]"
+        console.print(
+            Panel(
+                tool_info,
+                title=title,
+                border_style="red" if is_destructive else "green",
+                padding=(1, 2)
+            )
+        )
+
+        # Show instructions
+        instructions = "[bold green]y[/bold green] approve • [bold red]n[/bold red] deny • [bold]Shift+Tab[/bold] toggle mode"
+        console.print(instructions, justify="center")
+
+        # Get response (supports mode toggle)
+        while True:
+            response = get_tool_approval_key()
+            if response == 't':
+                return 'toggle'
+            elif response == 'y':
+                console.print("[green]✓ Approved[/green]")
+                return True
+            elif response == 'n':
+                console.print(
+                    Panel(
+                        "[green]⊘ Denied[/green]",
+                        title="[green]Cancelled[/green]",
+                        border_style="green"
+                    )
+                )
+                return False
+            # If None (invalid key), loop and ask again
+    else:
+        # UNSAFE mode: show but don't ask
+        console.print()
+        console.print(
+            Panel(
+                tool_info,
+                title="[bold red]🚀 Auto-Executing (UNSAFE)[/bold red]",
+                border_style="red",
+                style="dim"
+            )
+        )
+        instructions = "[dim]→ [bold]Shift+Tab[/bold] to toggle to SAFE mode[/dim]"
+        console.print(instructions, justify="center")
+        return True
+
 def call_model(provider_name, provider_model, key, messages):
     headers = {"Content-Type": "application/json"}
-    # --- SANITIZE MESSAGES (fix Anthropic trailing whitespace error) ---
     sanitized_messages = []
     for m in messages:
         sanitized = m.copy()
@@ -863,7 +1158,6 @@ def call_model(provider_name, provider_model, key, messages):
         with Live(Spinner("dots", text="Thinking..."), refresh_per_second=12):
             response = requests.post(url, headers=headers, json=payload, stream=True, timeout=60)
             if response.status_code != 200:
-                # Anthropic fallback logic for outdated model strings
                 if provider_name == "Anthropic" and response.status_code == 404:
                     fallback_map = {
                         "claude-haiku-4-5-20251001": "claude-haiku-4-5",
@@ -918,7 +1212,6 @@ def call_model(provider_name, provider_model, key, messages):
         if thinking_text or full_text:
             final_text = full_text.strip()
 
-            # 1️⃣ Normalize OpenAI-style tool_calls / function_call
             try:
                 parsed = json.loads(final_text)
                 normalized = normalize_openai_tool_call(parsed)
@@ -927,26 +1220,69 @@ def call_model(provider_name, provider_model, key, messages):
             except:
                 pass
 
-            # 2️⃣ Normalize NVIDIA-style tool format:
-            # <|tool_call_begin|> functions.read_file:5 ...
-            if "<|tool_call_begin|>" in final_text:
+            if "<|tool_calls_section_begin|>" in final_text:
                 try:
-                    name_match = re.search(r'functions\.(\w+)', final_text)
-                    arg_match = re.search(r'\{.*\}', final_text, re.DOTALL)
-                    if name_match and arg_match:
-                        tool_name = name_match.group(1)
-                        args = json.loads(arg_match.group(0))
-                        return json.dumps({"tool": tool_name, "args": args})
-                except:
+                    tool_calls = []
+
+                    blocks = re.findall(
+                        r'<\|tool_call_begin\|>.*?functions\.(\w+).*?(\{.*?\})',
+                        final_text,
+                        re.DOTALL
+                    )
+
+                    for name, args_json in blocks:
+                        try:
+                            args = json.loads(args_json)
+                            tool_calls.append({"tool": name, "args": args})
+                        except Exception:
+                            continue
+
+                    if tool_calls:
+                        # Return ALL tool calls as a batch (true multi-tool execution)
+                        return json.dumps(tool_calls)
+
+                except Exception:
                     pass
 
-            # 3️⃣ Fallback to normal text output
             if thinking_text and full_text:
-                return f"[dim]💭 Thinking: {thinking_text}[/dim]\n\n{full_text}"
+                return f"💭 Thinking:\n{thinking_text}\n\n{full_text}"
             return thinking_text or full_text
 
         return "[dim](Empty response)[/dim]"
     except Exception as e: return f"[red]Error: {str(e)}[/red]"
+
+def get_multiline_input(prompt="› "):
+    """Multi-line input: Enter to send, Shift+Enter for newline."""
+    if HAS_PROMPT_TOOLKIT:
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.keys import Keys
+
+        # Custom key bindings for proper Enter behavior
+        kb = KeyBindings()
+
+        @kb.add(Keys.ControlJ)  # Enter
+        def _(event):
+            """Accept input on Ctrl+J (Enter)"""
+            event.current_buffer.validate_and_set()
+            event.app.exit()
+
+        @kb.add(Keys.Escape)
+        def _(event):
+            """Cancel with Escape"""
+            event.app.exit_with_exception(KeyboardInterrupt())
+
+        session = PromptSession(key_bindings=kb)
+        try:
+            return session.prompt(
+                prompt,
+                multiline=True,
+                editing_mode=EditingMode.VI,
+            )
+        except KeyboardInterrupt:
+            return ""
+    else:
+        console.print(f"[bold {get_theme_color('text')}]{prompt}[/bold {get_theme_color('text')}]", end="")
+        return input()
 
 def run_onboarding():
     console.clear()
@@ -957,10 +1293,10 @@ def run_onboarding():
   | | | |_) |  _| |  \| | |   | |    | | 
   | | |  __/| |___| |\  | |___| |___ | | 
   \_/|_|   |_____|_| \_|\____|_____|___|
-""", "cyan"),
+""", "green"),
         ("\n\nWelcome to OpenCLI!\n", "bold white")
     )
-    console.print(Align.center(Panel(welcome_text, box=box.ROUNDED, border_style="cyan")))
+    console.print(Align.center(Panel(welcome_text, box=box.ROUNDED, border_style="green")))
     theme_choice = Prompt.ask("\n[bold white]1. Theme?[/bold white]", choices=["dark", "light"], default="dark")
     config["theme"] = theme_choice
     provider = Prompt.ask("\n2. Provider", choices=["OpenRouter", "Anthropic", "Google", "OpenAI", "NVIDIA", "Ollama"], default="OpenRouter")
@@ -997,9 +1333,14 @@ def main():
         banner(config.get("mode", "safe"), config.get("model"))
     if not CONFIG_FILE.exists(): run_onboarding()
     
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    session_id = None
+    messages = [{"role": "system", "content": build_system_prompt()}]
+    # Unique session per process
+    PROCESS_SESSION_ID = str(uuid.uuid4())
+    session_id = PROCESS_SESSION_ID
     resumed = False
+
+    # Track modified files for session
+    modified_files = set()
 
     global CURRENT_MESSAGES, CURRENT_SESSION_ID
     CURRENT_MESSAGES = messages
@@ -1031,18 +1372,16 @@ def main():
             f"Messages: {total_msgs}\n"
             f"Tool Calls: {tool_count}\n"
             f"Working Dir: {os.getcwd()}",
-            border_style="cyan"
+            border_style="green"
         ))
 
-        # Show only last 6 conversational turns (no tool dumps)
         conversational = [m for m in messages if m["role"] in ("user", "assistant")]
         for m in conversational[-6:]:
             if m["role"] == "assistant":
-                console.print(Panel(m["content"][:800], style="cyan", title="OpenCLI 💭"))
+                console.print(Panel(m["content"][:800], style="green", title="OpenCLI 💭"))
             elif m["role"] == "user":
                 console.print(f"[bold {get_theme_color('text')}]You[/bold {get_theme_color('text')}] › {m['content']}")
 
-    # Lightweight project context (no full directory dump)
     if not resumed:
         cwd = os.getcwd()
         messages.append({
@@ -1075,7 +1414,7 @@ def main():
                 f"\n[bold {text_c}]You[/bold {text_c}] "
                 "[dim](/ → settings • /resume → load chat • /clear → reset • exit → quit)[/dim]"
             )
-            user_input = console.input("› ")
+            user_input = get_multiline_input("› ")
 
             if user_input.strip() == "/":
                 interactive_settings_menu()
@@ -1106,18 +1445,18 @@ def main():
                         f"Messages: {total_msgs}\n"
                         f"Tool Calls: {tool_count}\n"
                         f"Working Dir: {os.getcwd()}",
-                        border_style="cyan"
+                        border_style="green"
                     ))
 
                     conversational = [m for m in messages if m["role"] in ("user", "assistant")]
                     for m in conversational[-6:]:
                         if m["role"] == "assistant":
-                            console.print(Panel(m["content"][:800], style="cyan", title="OpenCLI 💭"))
+                            console.print(Panel(m["content"][:800], style="green", title="OpenCLI 💭"))
                         elif m["role"] == "user":
                             console.print(f"[bold {get_theme_color('text')}]You[/bold {get_theme_color('text')}] › {m['content']}")
                 continue
             if user_input.strip() == "/clear":
-                messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                messages = [{"role": "system", "content": build_system_prompt()}]
                 session_id = None
                 CURRENT_MESSAGES = messages
                 CURRENT_SESSION_ID = session_id
@@ -1132,133 +1471,174 @@ def main():
                 break
 
             messages.append({"role": "user", "content": user_input})
+            _agent_steps = 0
             session_id = save_history(messages, session_id)
             CURRENT_MESSAGES = messages
             CURRENT_SESSION_ID = session_id
-            # Initial compaction per user turn
             messages, tokens, limit = compact_context(messages, p_model)
             console.print(Align.right(Text(f"Context: {(tokens*100)//limit}%", style="dim")))
             while True:
+                # Track timing for model response
+                start_time = time_module.time()
                 reply = call_model(p_name, p_model, key, messages)
+                response_time = time_module.time() - start_time
+                # Extract embedded tool JSON even if model included reasoning text
+                visible_text, extracted_tool = extract_json(reply)
+                if extracted_tool:
+                    tool_calls = [extracted_tool]
+                    reasoning = visible_text
+                else:
+                    tool_calls = None
+                    reasoning = reply
 
-                # ====== NEW LOGIC: Assistant message → tool call (tool JSON not stored in history) ======
-                reasoning, tool_call = extract_json(reply)
+                # --- Agent step guard (prevents infinite self-loops) ---
+                if "_agent_steps" not in locals():
+                    _agent_steps = 0
+                _agent_steps += 1
+                MAX_AGENT_STEPS = 5
 
-                # --- ENSURE extract_json HANDLES RAW JSON TOOL RETURNS CLEANLY ---
-                # If model returned raw JSON (OpenAI-normalized), parse it directly
-                if not tool_call:
-                    try:
-                        parsed = json.loads(reply.strip())
-                        if isinstance(parsed, dict) and "tool" in parsed:
-                            tool_call = parsed
-                            reasoning = ""
-                    except:
-                        pass
+                # reply_stripped = reply.strip()
 
+                executed_tools = False
 
-                # If the model included normal text, show it and store it
                 if reasoning.strip():
-                    md = Markdown(reasoning)
-                    console.print(
-                        Panel(md, border_style="cyan", title="OpenCLI 💭")
-                    )
-                    messages.append({"role": "assistant", "content": reasoning})
+
+                    raw_output = reasoning
+
+                    think_matches = re.findall(r"<think>(.*?)</think>", raw_output, re.DOTALL)
+                    cleaned_output = re.sub(r"<think>.*?</think>", "", raw_output, flags=re.DOTALL).strip()
+
+                    for think_block in think_matches:
+                        think_text = think_block.strip()
+                        if think_text:
+                            console.print(
+                                Panel(
+                                    think_text,
+                                    border_style="green",
+                                    title="Thinking",
+                                    style="dim"
+                                )
+                            )
+
+                    if cleaned_output.startswith("💭 Thinking:"):
+                        parts = cleaned_output.split("\n\n", 1)
+                        thinking_part = parts[0].replace("💭 Thinking:\n", "").strip()
+                        cleaned_output = parts[1].strip() if len(parts) > 1 else ""
+
+                        if thinking_part:
+                            console.print(
+                                Panel(
+                                    thinking_part,
+                                    border_style="green",
+                                    title="Thinking",
+                                    style="dim"
+                                )
+                            )
+
+                    visible_output = cleaned_output.strip()
+
+                    if visible_output and visible_output.strip() != "TASK_COMPLETE":
+                        console.print(
+                            Panel(
+                                Markdown(visible_output),
+                                border_style="green",
+                                title="OpenCLI 💭"
+                            )
+                        )
+
+                        # Show timing and token info
+                        output_tokens = len(visible_output) // 4
+                        input_tokens = count_tokens(messages[:-1]) if len(messages) > 1 else 0
+                        timing_info = f"[dim]⏱ {format_time(response_time)} • "
+                        timing_info += f"📤 {format_tokens(output_tokens)} • "
+                        timing_info += f"📥 {format_tokens(input_tokens)} tokens[/dim]"
+                        console.print(Align.right(timing_info))
+
+                        # Store ONLY final visible output
+                        messages.append({"role": "assistant", "content": visible_output})
+                        session_id = save_history(messages, session_id)
+                        CURRENT_MESSAGES = messages
+                        CURRENT_SESSION_ID = session_id
+
+                if tool_calls:
+                    for tool_call in tool_calls:
+                        t_name = tool_call["tool"]
+                        args = tool_call.get("args", {})
+
+                        if t_name not in TOOLS:
+                            err_msg = f"Error: Tool {t_name} not found."
+                            console.print(Panel(err_msg, style="bold red"))
+                            messages.append({"role": "assistant", "content": err_msg})
+                            continue
+
+                        # Get approval (handles SAFE, UNSAFE, PLAN modes, and mode toggling)
+                        approval = get_tool_approval(
+                            t_name, args, mode,
+                            plan_mode=(mode == "plan")
+                        )
+
+                        # Handle mode toggle (Shift+Tab)
+                        if approval == 'toggle':
+                            mode = "safe" if mode != "safe" else "unsafe"
+                            config["mode"] = mode
+                            save_config(config)
+                            console.print(f"\n[green]Mode switched to: {mode.upper()}[/green]\n")
+                            banner(mode, config.get("model"))
+                            continue
+
+                        # Handle PLAN mode (skip execution)
+                        if approval == 'skip':
+                            executed_tools = False
+                            continue
+
+                        # Skip if denied
+                        if not approval:
+                            continue
+
+                        executed_tools = True
+
+                        # Execute tool with Claude Code-like UX
+                        result, display_output, tool_result_text = show_tool_execution(
+                            t_name, args, TOOLS[t_name],
+                            plan_mode=(mode == "plan"),
+                            modified_files=modified_files
+                        )
+
+                        # Display result(s) in chat
+                        if isinstance(display_output, list):
+                            for item in display_output:
+                                console.print(item)
+                        elif display_output:
+                            console.print(display_output)
+
+                        # Store tool result in messages for context
+                        if tool_result_text:
+                            truncated = truncate_tool_output(tool_result_text)
+
+                            if p_name == "Anthropic":
+                                messages.append({
+                                    "role": "assistant",
+                                    "content": f"[Tool Result: {t_name}]\n{truncated}"
+                                })
+                            else:
+                                messages.append({
+                                    "role": "tool",
+                                    "name": t_name,
+                                    "content": truncated
+                                })
+
+                    # After executing ALL tools, compact once and call model again
                     session_id = save_history(messages, session_id)
                     CURRENT_MESSAGES = messages
                     CURRENT_SESSION_ID = session_id
 
-                # If a tool call was requested, handle it separately
-                if tool_call:
-                    t_name, args = tool_call["tool"], tool_call.get("args", {})
+                    messages, tokens, limit = compact_context(messages, p_model)
+                    console.print(Align.right(Text(f"Context: {(tokens*100)//limit}%", style="dim")))
 
-                    if t_name not in TOOLS:
-                        err_msg = f"Error: Tool {t_name} not found."
-                        console.print(Panel(err_msg, style="bold red"))
-                        messages.append({"role": "assistant", "content": err_msg})
-                        session_id = save_history(messages, session_id)
-                        CURRENT_MESSAGES = messages
-                        CURRENT_SESSION_ID = session_id
-                        break
+                    continue
 
-                    approval = Prompt.ask(f"Approve {t_name}? [y/N]", choices=["y","n"], default="n", show_default=False)
+                # (AUTO-CONTINUE block removed)
 
-                    if mode == "safe" and approval != "y":
-                        console.print(
-                            Panel(
-                                "Tool execution denied.\n\nWhat would you like the agent to do instead?",
-                                title="Denied",
-                                style="yellow"
-                            )
-                        )
-                        session_id = save_history(messages, session_id)
-                        CURRENT_MESSAGES = messages
-                        CURRENT_SESSION_ID = session_id
-                        break
-
-                    try:
-                        result = TOOLS[t_name](**args)
-                        # Show compact one-line tool usage (no full dump)
-                        arg_preview = ", ".join(f"{k}={v}" for k, v in args.items())
-                        console.print(
-                            f"[green]Tool:[/green] {t_name}"
-                            + (f" [dim]({arg_preview})[/dim]" if arg_preview else "")
-                        )
-
-                        truncated = truncate_tool_output(result)
-
-                        # Append structured tool result (Anthropic does NOT support role="tool")
-                        if p_name == "Anthropic":
-                            messages.append({
-                                "role": "assistant",
-                                "content": f"[Tool Result: {t_name}]\n{truncated}"
-                            })
-                        else:
-                            messages.append({
-                                "role": "tool",
-                                "name": t_name,
-                                "content": truncated
-                            })
-
-                        session_id = save_history(messages, session_id)
-                        CURRENT_MESSAGES = messages
-                        CURRENT_SESSION_ID = session_id
-
-                        # Re-compact after tool output before next model call
-                        messages, tokens, limit = compact_context(messages, p_model)
-                        console.print(Align.right(Text(f"Context: {(tokens*100)//limit}%", style="dim")))
-
-                        continue
-
-                    except Exception as e:
-                        err_msg = f"Error executing tool '{t_name}': {str(e)}"
-                        console.print(Panel(err_msg, title="Tool Error", style="bold red"))
-
-                        # Feed tool failure back to model so it can retry or adjust
-                        error_text = f"Tool failed with error: {str(e)}"
-                        truncated_error = truncate_tool_output(error_text, limit=1000)
-
-                        if p_name == "Anthropic":
-                            messages.append({
-                                "role": "assistant",
-                                "content": f"[Tool Error: {t_name}]\n{truncated_error}"
-                            })
-                        else:
-                            messages.append({
-                                "role": "tool",
-                                "name": t_name,
-                                "content": truncated_error
-                            })
-
-                        session_id = save_history(messages, session_id)
-                        CURRENT_MESSAGES = messages
-                        CURRENT_SESSION_ID = session_id
-
-                        # Re-compact after tool error before retry
-                        messages, tokens, limit = compact_context(messages, p_model)
-                        console.print(Align.right(Text(f"Context: {(tokens*100)//limit}%", style="dim")))
-
-                        continue
-                # If no tool call, finish the loop (after showing/storing reasoning if any)
                 break
         except KeyboardInterrupt:
             quit_choice = Prompt.ask("Quit? [y/N]", choices=["y","n"], default="n", show_default=False)
