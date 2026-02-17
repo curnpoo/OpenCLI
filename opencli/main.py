@@ -1270,13 +1270,58 @@ def call_model(provider_name, provider_model, key, messages):
   except Exception as e: return f"[red]Error: {str(e)}[/red]"
 
 def get_multiline_input(prompt="› "):
-  """Simple input: Enter to send, Shift+Tab to cycle mode."""
-  # Use basic input - simple and reliable
-  console.print(f"[bold {get_theme_color('text')}]{prompt}[/bold {get_theme_color('text')}]", end="")
+  """Input handler: Enter to send, Shift+Tab to cycle mode."""
+  console.print(f"[bold {get_theme_color('text')}]{prompt}[/bold {get_theme_color('text')}]", end="", flush=True)
+
+  fd = sys.stdin.fileno()
+  old_settings = termios.tcgetattr(fd)
   try:
-    return input()
+    tty.setraw(fd)
+    text = ""
+
+    while True:
+      ch = sys.stdin.read(1)
+
+      # Check for Shift+Tab (ESC [ Z sequence)
+      if ch == '\x1b':  # ESC
+        try:
+          next_ch = sys.stdin.read(1)
+          if next_ch == '[':
+            third_ch = sys.stdin.read(1)
+            if third_ch == 'Z':  # Shift+Tab
+              termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+              return "MODE_CYCLE"
+        except:
+          pass
+
+      # Enter sends
+      if ch == '\r' or ch == '\n':
+        print()  # New line after input
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        return text
+
+      # Ctrl+C to cancel
+      if ch == '\x03':
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        return ""
+
+      # Backspace
+      if ch == '\x7f':  # Backspace
+        if text:
+          text = text[:-1]
+          sys.stdout.write('\b \b')  # Delete character on screen
+          sys.stdout.flush()
+
+      # Regular character
+      elif ord(ch) >= 32:  # Printable character
+        text += ch
+        sys.stdout.write(ch)
+        sys.stdout.flush()
+
   except KeyboardInterrupt:
     return ""
+  finally:
+    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 def run_onboarding():
   console.clear()
