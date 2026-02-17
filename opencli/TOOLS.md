@@ -1,3 +1,5 @@
+***ALWAYS USE OPENAI STYLE TOOL CALLS***
+
 
 You are **OpenCLI**, an expert autonomous coding agent operating inside a terminal environment.
 

@@ -32,6 +32,9 @@ from filelock import FileLock
 import uuid
 import time as time_module
 
+# Tool execution settings
+TOOL_BATCH_DELAY = 2.0  # seconds between tools in a batch
+
 try:
   from prompt_toolkit import PromptSession
   from prompt_toolkit.enums import EditingMode
@@ -595,17 +598,32 @@ def list_files(path="."):
   except Exception as e:
     return f"Error: {str(e)}"
 
+# File cache for storing full file contents to avoid re-reading
+# Key: absolute path, Value: full file content string
+file_cache = {}
+
+def cache_clear():
+  """Clear the file cache. Useful when files are modified externally."""
+  file_cache.clear()
+  return "File cache cleared."
+
 def read_file(path, offset=None, limit=None):
   """
   Read a file. Supports optional offset (line number) and limit (number of lines)
-  for partial reads. Fully backward compatible with old calls.
+  for partial reads. Full file is cached for subsequent operations.
   """
   if not os.path.exists(path):
     return "File not found."
 
   try:
-    with open(path, "r") as f:
-      lines = f.readlines()
+    # Read full file and cache it
+    abs_path = os.path.abspath(path)
+    if abs_path not in file_cache:
+      with open(abs_path, "r") as f:
+        file_cache[abs_path] = f.read()
+
+    # Use cached content
+    lines = file_cache[abs_path].splitlines(keepends=True)
 
     # Normalize offset
     if offset is not None:
@@ -635,7 +653,10 @@ def read_file(path, offset=None, limit=None):
     return f"Error reading file: {str(e)}"
 
 def write_file(path, content):
-  with open(path, "w") as f: f.write(content)
+  abs_path = os.path.abspath(path)
+  with open(abs_path, "w") as f: f.write(content)
+  # Update cache
+  file_cache[abs_path] = content
   return f"Wrote {path}"
 
 def run_shell(command):
@@ -648,27 +669,63 @@ def run_shell(command):
   except Exception as e:
     return f"Error: {str(e)}"
 
-def replace_text(path, old_text, new_text):
+def replace_text(path, **kwargs):
+  # Support multiple parameter names: old_text/new_text, old/new, oldString/newString
+  old_text = kwargs.get('old_text') or kwargs.get('old') or kwargs.get('oldString')
+  new_text = kwargs.get('new_text') or kwargs.get('new') or kwargs.get('newString')
+
+  if not old_text or not new_text:
+    return "Error: replace_text requires old_text/new_text (or old/new/oldString/newString) parameters."
+
+  abs_path = os.path.abspath(path)
   if not os.path.exists(path): return f"Error: File '{path}' not found."
   try:
-    with open(path, "r") as f: content = f.read()
+    with open(abs_path, "r") as f: content = f.read()
     if old_text not in content: return f"Error: Could not find exact match."
     new_content = content.replace(old_text, new_text, 1)
-    with open(path, "w") as f: f.write(new_content)
+    with open(abs_path, "w") as f: f.write(new_content)
+    # Update cache
+    file_cache[abs_path] = new_content
     return f"Successfully replaced text in {path}."
   except Exception as e:
     return f"Error: {str(e)}"
 
 def search_code(query, path="."):
+  """
+  Search for query in cached files. Uses file_cache for previously read files,
+  falling back to grep for uncached files.
+  """
+  matches = []
+
+  # First, search in cached files
+  for abs_path, content in file_cache.items():
+    if path != "." and not abs_path.startswith(os.path.abspath(path)):
+      continue
+    lines = content.splitlines()
+    for i, line in enumerate(lines, 1):
+      if query.lower() in line.lower():
+        matches.append(f"{abs_path}:{i}:{line}")
+
+  # Fall back to grep for uncached files
   try:
-    result = subprocess.run(["grep", "-r", "-n", "--exclude-dir={.git,node_modules,__pycache__}", query, path], capture_output=True, text=True, timeout=30)
-    output = result.stdout.strip()
-    if not output: return f"No matches found for '{query}'."
-    lines = output.splitlines()
-    if len(lines) > 50: return "\n".join(lines[:50]) + f"\n\n... (truncated)"
-    return output
-  except Exception as e:
-    return f"Error: {str(e)}"
+    result = subprocess.run(
+      ["grep", "-r", "-n", "--exclude-dir={.git,node_modules,__pycache__}", query, path],
+      capture_output=True, text=True, timeout=30
+    )
+    for line in result.stdout.strip().splitlines():
+      # Skip if already in matches (from cache)
+      if line not in [m.split(":", 2)[-1] if ":" in m else "" for m in matches]:
+        matches.append(line)
+  except:
+    pass
+
+  if not matches:
+    return f"No matches found for '{query}'."
+
+  if len(matches) > 50:
+    return "\n".join(matches[:50]) + f"\n\n... (truncated to 50 matches)"
+
+  return "\n".join(matches)
 
 TOOLS = {
   "list_files": list_files,
@@ -676,7 +733,8 @@ TOOLS = {
   "write_file": write_file,
   "replace_text": replace_text,
   "search_code": search_code,
-  "run_shell": run_shell
+  "run_shell": run_shell,
+  "cache_clear": cache_clear
 }
 
 TOOL_METADATA = {
@@ -703,8 +761,13 @@ TOOL_METADATA = {
   "run_shell": {
     "description": "Execute shell command",
     "destructive": True
+  },
+  "cache_clear": {
+    "description": "Clear the file cache (use when files are modified externally)",
+    "destructive": False
   }
 }
+
 
 def truncate_tool_output(output, limit=2000):
   """
@@ -715,6 +778,42 @@ def truncate_tool_output(output, limit=2000):
   if len(text) <= limit:
     return text
   return text[:limit] + "\n\n... (truncated for context safety)"
+
+# --- Tool Error/Rate Limit Helpers ---
+def is_rate_limit_error(error_msg):
+  indicators = [
+    "rate_limit", "rate limit", "too many requests",
+    "429", "quota exceeded", "max requests"
+  ]
+  msg = str(error_msg).lower()
+  return any(ind in msg for ind in indicators)
+
+
+def handle_tool_error(tool_name, error_msg, messages):
+  console.print(
+    Panel(
+      f"[bold red]Tool Error: {tool_name}[/bold red]\n\n{error_msg}",
+      border_style="red",
+      title="Error"
+    )
+  )
+  console.print("[bold]Options:[/bold]")
+  console.print("  [green]r[/green] Retry")
+  console.print("  [yellow]s[/yellow] Skip")
+  console.print("  [dim]c[/dim] Continue (add error to chat)")
+  console.print("  [red]q[/red] Quit tool loop")
+
+  while True:
+    key = get_tool_approval_key()
+    if key == 'r':
+      return 'retry'
+    if key == 's':
+      return 'skip'
+    if key == 'c':
+      messages.append({"role": "assistant", "content": f"Tool '{tool_name}' failed: {error_msg}"})
+      return 'continue'
+    if key == 'q':
+      return 'quit'
 
 def generate_unified_diff(file_path, old_content, new_content):
   """Generate a unified diff between old and new content."""
@@ -739,8 +838,12 @@ def show_tool_execution(tool_name, args, tool_func, plan_mode=False, modified_fi
 
   Returns: (result, display_panels, tool_result_text)
   """
+  # In plan mode, only skip destructive tools - execute read tools to build context
   if plan_mode:
-    return None, "[dark_green]→ PLAN mode: tool skipped (learning & analyzing)[/dark_green]", None
+    read_only_tools = {"list_files", "read_file", "search_code", "cache_clear"}
+    if tool_name not in read_only_tools:
+      return None, "[dark_green]→ PLAN mode: skipped (write tool)[/dark_green]", None
+    # Execute read-only tools normally to build context
 
   # Show execution with spinner
   arg_str = ", ".join([f"{k}={v}" for k, v in args.items()])
@@ -769,21 +872,34 @@ def show_tool_execution(tool_name, args, tool_func, plan_mode=False, modified_fi
     if modified_files is not None:
       modified_files.add(file_path)
 
-    # Show before/after diff
-    diff_content = f"""[bold green]{file_path}[/bold green]
+    # Show clear diff like Claude Code
+    old_lines = old_text.split('\n')
+    new_lines = new_text.split('\n')
 
-[bold red]REMOVED[/bold red]
-[red]{old_text}[/red]
+    # Format with line-by-line diff
+    diff_lines = []
+    diff_lines.append(f"[green]{file_path}[/green]")
 
-[bold green]ADDED[/bold green]
-[green]{new_text}[/green]"""
+    # Show removed lines (red)
+    for i, line in enumerate(old_lines, 1):
+      if line.strip():
+        diff_lines.append(f"[red]{i}: {line[:60]}[/red]")
+
+    diff_lines.append("[dim]    ↓[/dim]")
+
+    # Show added lines (green)
+    for i, line in enumerate(new_lines, 1):
+      if line.strip():
+        diff_lines.append(f"[green]{i}: {line[:60]}[/green]")
+
+    diff_content = "\n".join(diff_lines)
 
     display_panels.append(
       Panel(
         diff_content,
-        title="[green] Text Replaced[/green]",
+        title=f"[green] Replace[/green]",
         border_style="green",
-        padding=(1, 2)
+        padding=(0, 1)
       )
     )
 
@@ -796,42 +912,59 @@ def show_tool_execution(tool_name, args, tool_func, plan_mode=False, modified_fi
     if modified_files is not None:
       modified_files.add(file_path)
 
-    # Show file creation summary
-    preview = content[:200] + ("..." if len(content) > 200 else "")
+    # Compact display
     display_panels.append(
       Panel(
-        f"[green] File created[/green]\n[dim]{file_path}[/dim]\n[dim]{lines} lines[/dim]\n\n[dim]{preview}[/dim]",
-        title="[green] File Written[/green]",
+        f"[green]{file_path}[/green]\n[dim]{lines} lines[/dim]",
+        title="[green] Write[/green]",
         border_style="green",
-        padding=(1, 2)
+        padding=(0, 1)
       )
     )
 
   # === STANDARD OUTPUT ===
   else:
-    # For read operations, show the output
+    # For read operations, show the output in Claude Code style
     if result_text.strip() and result_text not in ["(Command executed with no output)", "No files found."]:
-      truncated = truncate_tool_output(result_text, limit=1000)
-
-      # Format based on tool type
+      # Format based on tool type with Claude Code style
       if tool_name == "list_files":
-        title = " Files Found"
-        style = "green"
+        title = "Files Found"
+        truncated = truncate_tool_output(result_text, limit=500)
+        content = truncated
+
       elif tool_name == "read_file":
-        title = " File Contents"
-        style = "green"
+        # Show file path with optional offset/limit
+        file_path = args.get("path", "?")
+        offset = args.get("offset", 0)
+        limit = args.get("limit", "")
+        location = f"{file_path}:{offset}" + (f"-{limit}" if limit else "")
+        title = location
+
+        # Show first few lines as preview
+        lines = result_text.split("\n")
+        preview_lines = lines[:10]
+        truncated = "\n".join(preview_lines)
+        if len(lines) > 10:
+          truncated += f"\n... ({len(lines)} total lines)"
+        content = truncated
+
       elif tool_name == "search_code":
-        title = " Search Results"
-        style = "green"
+        # Show search query and matches
+        query = args.get("query", args.get("path", "search"))
+        title = f"Search: {query}"
+        truncated = truncate_tool_output(result_text, limit=500)
+        content = truncated
+
       else:
-        title = f"{tool_name} Output"
-        style = "green"
+        title = tool_name
+        truncated = truncate_tool_output(result_text, limit=500)
+        content = truncated
 
       display_panels.append(
         Panel(
-          f"[dim]{truncated}[/dim]",
-          title=f"[{style}]{title}[/{style}]",
-          border_style=style,
+          content,
+          title=f"[green]{title}[/green]",
+          border_style="green",
           padding=(1, 2)
         )
       )
@@ -883,9 +1016,14 @@ Never describe a tool call — only emit valid JSON.
 The CLI has three modes:
 - SAFE: You will call tools, but the user must approve each one
 - UNSAFE: You will call tools and they auto-execute
-- PLAN: You should analyze code and PLAN your approach, but NOT call tools (read-only mode)
+- PLAN: Build context by reading files, then present a complete detailed plan
 
-In PLAN mode, inspect files and reason about what needs to be done, but do not attempt tool calls.
+In PLAN mode:
+1. First understand the task by reading relevant files
+2. Use search_code to find specific functions/patterns efficiently
+3. After 2-3 read operations, STOP and think about what you learned
+4. Present a detailed plan with specific files, changes, and reasoning
+5. Do NOT repeat the same searches - be efficient
 
 === CODE MODIFICATION RULES (REPLACE_TEXT FIRST POLICY) ===
 When modifying code:
@@ -913,41 +1051,76 @@ If unsure whether a full rewrite is necessary, default to `replace_text`.
   return f"{base}\n\n{tools_text}\n\n{strict_rules}"
 
 def extract_json(text):
-  """
-  Extract first valid tool JSON object from model output.
-  Safely handles malformed trailing braces and embedded text.
-  """
-  cleaned = text.strip()
+  if not text:
+    return "", None
 
-  # Scan for first balanced JSON object
-  start = None
-  brace_count = 0
+  raw = text.strip()
 
-  for i, ch in enumerate(cleaned):
-    if ch == "{":
-      if start is None:
-        start = i
-      brace_count += 1
-    elif ch == "}":
-      brace_count -= 1
-      if brace_count == 0 and start is not None:
-        candidate = cleaned[start:i+1]
-        try:
-          obj = json.loads(candidate)
-          if isinstance(obj, dict) and "tool" in obj:
-            visible_text = cleaned[:start].strip()
-            return visible_text, obj
-        except Exception:
-          pass
-        start = None
+  # Strip common markdown fences
+  raw = re.sub(r"```(?:json)?", "", raw, flags=re.IGNORECASE).strip()
 
-  # No valid tool JSON found
-  return cleaned, None
+  # Strip rich panel borders and box characters
+  raw = raw.replace("│", "").replace("╭", "").replace("╰", "").replace("─", "")
+  raw = raw.strip()
+
+  # If the entire cleaned text is valid JSON, try that first
+  try:
+    parsed_full = json.loads(raw)
+    if isinstance(parsed_full, dict) and "tool" in parsed_full:
+      return "", parsed_full
+    if isinstance(parsed_full, list) and all(isinstance(x, dict) and "tool" in x for x in parsed_full):
+      return "", parsed_full
+  except:
+    pass
+
+  # Also check for tool calls anywhere in the text (including thinking)
+  # This catches malformed JSON that the model puts in thinking
+  # Use a more flexible pattern that handles nested braces
+  tool_pattern = r'\{\s*"tool"\s*:\s*"(\w+)"\s*,\s*"args"\s*:\s*(\{.*?\})'
+  matches = re.findall(tool_pattern, raw, re.DOTALL)
+  if matches:
+    tool_calls = []
+    for name, args_str in matches:
+      try:
+        # Try to parse args as JSON - skip if invalid
+        args = json.loads(args_str)
+        tool_calls.append({"tool": name, "args": args})
+      except:
+        # Skip malformed tool calls
+        continue
+    if tool_calls:
+      return "", tool_calls
+
+  # Find ALL JSON objects (not minimal, but balanced by attempting parse)
+  candidates = re.findall(r'\{[\s\S]*?\}', raw)
+
+  for candidate in candidates:
+    candidate = candidate.strip()
+    try:
+      parsed = json.loads(candidate)
+      if isinstance(parsed, dict) and "tool" in parsed:
+        return "", parsed
+    except:
+      continue
+
+  # Find JSON arrays for batch tool calls
+  array_candidates = re.findall(r'\[[\s\S]*?\]', raw)
+
+  for candidate in array_candidates:
+    candidate = candidate.strip()
+    try:
+      parsed = json.loads(candidate)
+      if isinstance(parsed, list) and all(isinstance(x, dict) and "tool" in x for x in parsed):
+        return "", parsed
+    except:
+      continue
+
+  return raw, None
 
 def normalize_openai_tool_call(data):
   """
   Normalize OpenAI-style tool_calls or function_call into
-  internal {"tool": name, "args": {...}} format.
+  internal {"tool": name, "args": {...}, "id": ...} format.
   """
   try:
     if not isinstance(data, dict):
@@ -960,11 +1133,12 @@ def normalize_openai_tool_call(data):
         call = msg["tool_calls"][0]
         name = call.get("function", {}).get("name")
         args_raw = call.get("function", {}).get("arguments", "{}")
+        tool_call_id = call.get("id")  # Get the tool_call_id
         try:
           args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
         except:
           args = {}
-        return {"tool": name, "args": args}
+        return {"tool": name, "args": args, "id": tool_call_id}
 
       # Handle legacy function_call
       if "function_call" in msg:
@@ -1022,11 +1196,11 @@ def get_tool_approval_key():
       except:
         pass
 
-    # Single key presses
+    # Single key presses - require explicit y or n
     if ch in ['y', 'n']:
       return ch
     elif ch == '\r' or ch == '\n':
-      return 'n' # Default to deny
+      return None  # Enter doesn't auto-approve - requires explicit y
     elif ch == '\x03': # Ctrl+C
       raise KeyboardInterrupt
     else:
@@ -1034,14 +1208,23 @@ def get_tool_approval_key():
   finally:
     termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
-def get_tool_approval(tool_name, args, mode, plan_mode=False):
+def get_tool_approval(tool_name, args, mode, plan_mode=False, thinking=""):
   """
   Robust tool approval with metadata, single-key input, and mode toggle.
   Returns: True (approve), False (deny), 'toggle' (switch modes), or 'skip' (plan mode).
+  Auto-approves read-only tools silently without showing any panel.
   """
   metadata = TOOL_METADATA.get(tool_name, {})
   description = metadata.get("description", "Unknown tool")
   is_destructive = metadata.get("destructive", False)
+
+  # Read-only tools - always auto-approve silently (like Claude Code)
+  # But show thinking first if available
+  read_only_tools = {"list_files", "read_file", "search_code", "cache_clear"}
+  if tool_name in read_only_tools:
+    if thinking:
+      console.print(f"[dim]⏺ {thinking[:100]}[/dim]\n")
+    return True
 
   # Build tool info display with description
   args_display = "\n".join([f" • {k}: {v}" for k, v in args.items()]) if args else " (no args)"
@@ -1049,21 +1232,27 @@ def get_tool_approval(tool_name, args, mode, plan_mode=False):
   tool_info = f"{destructive_badge}[bold green]{tool_name}[/bold green]\n[dim]{description}[/dim]\n\n{args_display}"
 
   if plan_mode:
-    # PLAN mode: never execute, just show what would happen
+    # PLAN mode: skip all write tools
     console.print()
     console.print(
       Panel(
         tool_info,
-        title="[bold dark_green] PLAN MODE (Read-Only)[/bold dark_green]",
-        border_style="green",
+        title="[bold dark_green] PLAN MODE (Skipped)[/bold dark_green]",
+        border_style="dark_green",
         padding=(1, 2)
       )
     )
-    console.print("[dark_green]→ Tool execution skipped (PLAN mode: learning & planning only)[/dark_green]")
+    console.print("[dark_green]→ Skipped (PLAN mode: write tool)[/dark_green]")
     return 'skip'
 
   if mode == "safe":
-    # SAFE mode: ALWAYS show approval with metadata
+    # SAFE mode: approval needed for write/destructive tools only
+    # Read-only tools auto-approve silently
+    read_only_tools = {"list_files", "read_file", "search_code", "cache_clear"}
+    if tool_name in read_only_tools:
+      return True
+
+    # Show approval panel for write/destructive tools
     console.print()
     title = f"{'[bold red] DESTRUCTIVE[/bold red] ' if is_destructive else ''}[bold green]Approve?[/bold green]"
     console.print(
@@ -1096,8 +1285,9 @@ def get_tool_approval(tool_name, args, mode, plan_mode=False):
           )
         )
         return False
-      # If None (invalid key), loop and ask again
-  else:
+      # If None (invalid key or Enter), loop and ask again
+      elif response is None:
+        continue
     # UNSAFE mode: show but don't ask
     console.print()
     console.print(
@@ -1175,6 +1365,21 @@ def call_model(provider_name, provider_model, key, messages):
   try:
     with Live(Spinner("dots", text="Thinking..."), refresh_per_second=12):
       response = requests.post(url, headers=headers, json=payload, stream=True, timeout=60)
+      if response.status_code == 429 or "rate_limit" in response.text.lower():
+        # Rate limited - wait and retry with backoff
+        for attempt in range(3):
+          wait_time = (attempt + 1) * 3  # 3, 6, 9 seconds
+          console.print(f"[yellow]Rate limited (429). Waiting {wait_time}s...[/yellow]")
+          time.sleep(wait_time)
+          response = requests.post(url, headers=headers, json=payload, stream=True, timeout=60)
+          if response.status_code == 200:
+            break
+          if "rate_limit" not in response.text.lower() and response.status_code != 429:
+            break
+        else:
+          # All retries exhausted
+          return "[yellow]Rate limited. Please wait a moment and try again.[/yellow]"
+
       if response.status_code != 200:
         if provider_name == "Anthropic" and response.status_code == 404:
           fallback_map = {
@@ -1262,15 +1467,47 @@ def call_model(provider_name, provider_model, key, messages):
         except Exception:
           pass
 
+      # Also check for tool calls in thinking text (model puts them in thinking)
+      if thinking_text:
+        # Check for <|tool_call_begin|> format
+        if "<|tool_call_begin|>" in thinking_text:
+          try:
+            tool_calls = []
+            blocks = re.findall(
+              r'<\|tool_call_begin\|>.*?functions\.(\w+).*?(\{.*?\})',
+              thinking_text,
+              re.DOTALL
+            )
+            for name, args_json in blocks:
+              try:
+                args = json.loads(args_json)
+                tool_calls.append({"tool": name, "args": args})
+              except Exception:
+                continue
+            if tool_calls:
+              return json.dumps(tool_calls)
+          except Exception:
+            pass
+
+        # Also check for plain JSON tool calls in thinking
+        json_candidates = re.findall(r'\{[\s\S]*?"tool"[\s\S]*?\}', thinking_text)
+        for candidate in json_candidates:
+          try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict) and "tool" in parsed:
+              return json.dumps([parsed])
+          except:
+            continue
+
       if thinking_text and full_text:
         return f" Thinking:\n{thinking_text}\n\n{full_text}"
       return thinking_text or full_text
 
-    return "[dim](Empty response)[/dim]"
+    return "[dim](No response - retrying...)[/dim]"
   except Exception as e: return f"[red]Error: {str(e)}[/red]"
 
 def get_multiline_input(prompt="› "):
-  """Input handler: Enter to send, Shift+Tab to cycle mode."""
+  """Input handler: Enter to send, Shift+Tab to cycle mode. Handles pasted text without triggering on newlines."""
   console.print(f"[bold {get_theme_color('text')}]{prompt}[/bold {get_theme_color('text')}]", end="")
   sys.stdout.flush()
 
@@ -1279,8 +1516,26 @@ def get_multiline_input(prompt="› "):
   try:
     tty.setraw(fd)
     text = ""
+    # Track paste mode
+    paste_mode = False
+    last_char_time = 0
+    import time as time_module
 
     while True:
+      # Read with short timeout
+      import select
+      ready, _, _ = select.select([fd], [], [], 0.01)
+
+      if not ready:
+        # No data, just continue waiting
+        continue
+
+      # Data available - read it
+      current_time = time_module.time()
+      if current_time - last_char_time < 0.02 and last_char_time > 0:
+        paste_mode = True
+      last_char_time = current_time
+
       ch = sys.stdin.read(1)
 
       # Check for Shift+Tab (ESC [ Z sequence)
@@ -1295,23 +1550,32 @@ def get_multiline_input(prompt="› "):
         except:
           pass
 
-      # Enter sends
+      # Ignore Enter/Return in paste mode (newlines are part of pasted text)
       if ch == '\r' or ch == '\n':
-        print()  # New line after input
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        return text
+        if paste_mode:
+          text += ch
+          sys.stdout.write(ch)
+          sys.stdout.flush()
+          continue
+        # Not paste mode - if we have text, send it
+        if text:
+          termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+          return text
+        continue
 
       # Ctrl+C to cancel
       if ch == '\x03':
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        return ""
+        return "CTRL_CANCEL"
 
       # Backspace
       if ch == '\x7f':  # Backspace
         if text:
           text = text[:-1]
-          sys.stdout.write('\b \b')  # Delete character on screen
+          sys.stdout.write('\b \b')
           sys.stdout.flush()
+        # Also handle paste mode toggle on backspace
+        paste_mode = False
 
       # Regular character
       elif ord(ch) >= 32:  # Printable character
@@ -1458,7 +1722,7 @@ def main():
         f"\n[bold {text_c}]You[/bold {text_c}] "
         "[dim](/ → settings • /resume → load chat • /clear → reset • exit → quit)[/dim]"
       )
-      console.print(f"{mode_text} [dim]Enter=send • Shift+Tab=cycle mode[/dim]")
+      console.print(f"{mode_text} [dim]Enter → send • Shift+Enter → newline • Shift+Tab=cycle[/dim]")
 
       # Get input with mode cycling support
       while True:
@@ -1469,10 +1733,23 @@ def main():
           mode = cycle_mode(mode)
           config["mode"] = mode
           save_config(config)
-          mode_text = get_mode_indicator(mode)
-          console.print(f"\n{mode_text} Mode changed\n")
-          # Show mode indicator again and re-prompt
-          console.print(f"{mode_text} [dim]Enter=send • Shift+Tab=cycle mode[/dim]")
+          console.print(f"\n[green]Mode changed to {mode.upper()}[/green]")
+          continue
+
+        # Ctrl+C always quits immediately
+        if user_input == "CTRL_CANCEL":
+          session_id = save_history(messages, session_id)
+          console.print("\n[green]Goodbye![/green]")
+          sys.exit(0)
+
+        # Escape or empty input cancels - just show prompt again
+        if user_input == "" or user_input == "CANCEL":
+          console.print()
+          continue
+
+        # Only send if there's actual content or a command
+        if not user_input.strip() and not user_input.startswith("/"):
+          console.print()
           continue
         break
 
@@ -1516,19 +1793,26 @@ def main():
               console.print(f"[bold {get_theme_color('text')}]You[/bold {get_theme_color('text')}] › {m['content']}")
         continue
       if user_input.strip() == "/clear":
-        messages = [{"role": "system", "content": build_system_prompt()}]
-        session_id = None
-        CURRENT_MESSAGES = messages
-        CURRENT_SESSION_ID = session_id
-        console.clear()
-        config = load_config()
-        banner(config.get("mode", "safe"), config.get("model"))
+        console.print("\n[bold red]Are you sure you want to clear the session?[/bold red]")
+        confirm = Prompt.ask("[yellow]Type 'y' to confirm, 'n' to cancel:[/yellow]", default="n")
+        if confirm.lower() == 'y':
+          messages = [{"role": "system", "content": build_system_prompt()}]
+          session_id = None
+          CURRENT_MESSAGES = messages
+          CURRENT_SESSION_ID = session_id
+          console.clear()
+          config = load_config()
+          banner(config.get("mode", "safe"), config.get("model"))
         continue
       if user_input.lower() in ["exit", "quit"]:
         session_id = save_history(messages, session_id)
         CURRENT_MESSAGES = messages
         CURRENT_SESSION_ID = session_id
         break
+
+      # Don't send empty input
+      if not user_input.strip():
+        continue
 
       messages.append({"role": "user", "content": user_input})
       _agent_steps = 0
@@ -1537,19 +1821,202 @@ def main():
       CURRENT_SESSION_ID = session_id
       messages, tokens, limit = compact_context(messages, p_model)
       console.print(Align.right(Text(f"Context: {(tokens*100)//limit}%", style="dim")))
+
       while True:
         # Track timing for model response
         start_time = time_module.time()
+
+        # Add small delay between requests to respect RPM limits (40 RPM = 1.5s between requests)
+        global _last_request_time
+        if '_last_request_time' in globals():
+          elapsed = time_module.time() - _last_request_time
+          if elapsed < 1.5:
+            time.sleep(1.5 - elapsed)
+        _last_request_time = time_module.time()
+
         reply = call_model(p_name, p_model, key, messages)
+
+        # Handle empty or error responses - retry
+        if "No response" in reply or not reply.strip():
+          console.print(" Retrying...", style="yellow")
+          time.sleep(1)
+          continue
         response_time = time_module.time() - start_time
-        # Extract embedded tool JSON even if model included reasoning text
-        visible_text, extracted_tool = extract_json(reply)
-        if extracted_tool:
-          tool_calls = [extracted_tool]
-          reasoning = visible_text
-        else:
-          tool_calls = None
-          reasoning = reply
+
+        # --- Display thinking FIRST (before tool execution) ---
+        # Extract thinking from reply if present
+        raw_output = reply
+        think_matches = re.findall(r"<think>(.*?)</think>", raw_output, re.DOTALL)
+        has_thinking = bool(think_matches) or " Thinking:" in raw_output
+
+        if has_thinking:
+          # Display thinking in Claude Code thought-chain style
+          think_content = []
+
+          for think_block in think_matches:
+            think_text = think_block.strip()
+            if think_text:
+              think_content.append(think_text)
+
+          if " Thinking:" in raw_output:
+            parts = raw_output.split("\n\n", 1)
+            if len(parts) > 1:
+              thinking_part = parts[0].replace(" Thinking:", "").strip()
+              if thinking_part:
+                think_content.append(thinking_part)
+
+          if think_content:
+            full_think = " ".join(think_content)
+            lines = [l.strip() for l in full_think.split('\n') if l.strip()]
+
+            # Format as thought chain
+            console.print()
+            for line in lines[:6]:
+              if line:
+                console.print(f"[green]⏺[/green] [dim]{line[:100]}[/dim]")
+            if len(lines) > 6:
+              console.print(f"[dim]  ... {len(lines) - 6} more[/dim]")
+
+            # Space between thinking and tool
+            console.print()
+
+        # --- STRICT TOOL INTERCEPTION (OpenAI-style JSON only) ---
+        model_output = reply
+        text, tool_data = extract_json(model_output)
+        # Fallback: if model wrapped JSON inside markdown or extra text,
+        # attempt to extract the first {...} block manually.
+        if not tool_data:
+          json_block_match = re.search(r'\{[\s\S]*\}', model_output)
+          if json_block_match:
+            try:
+              possible = json.loads(json_block_match.group(0))
+              if isinstance(possible, dict) and "tool" in possible:
+                tool_data = possible
+                text = ""
+            except:
+              pass
+
+        if tool_data:
+          # Normalize to list for batch execution
+          tool_calls = tool_data if isinstance(tool_data, list) else [tool_data]
+
+          for call in tool_calls:
+            tool_name = call.get("tool")
+            args = call.get("args", {})
+            tool_call_id = call.get("id") or call.get("tool_call_id")  # Get tool_call_id for API
+
+            if tool_name not in TOOLS:
+              err_msg = f"Error: Tool {tool_name} not found."
+              console.print(Panel(err_msg, style="bold red"))
+              messages.append({"role": "assistant", "content": err_msg})
+              continue
+
+            # Get first line of thinking for display
+            think_for_approval = ""
+            if has_thinking and think_content:
+              think_for_approval = think_content[0][:100] if think_content else ""
+
+            if has_thinking and think_content:
+              for line in think_content[:3]:
+                if line.strip():
+                  console.print(f"[dim]⏺ {line.strip()[:80]}[/dim]")
+              console.print()
+            else:
+              # No thinking detected - show a prompt for reasoning
+              console.print("[dim]⏺ Thinking...[/dim]")
+
+            approval = get_tool_approval(
+              tool_name,
+              args,
+              mode,
+              plan_mode=(mode == "plan"),
+              thinking=think_for_approval
+            )
+
+            if approval == 'toggle':
+              mode = cycle_mode(mode)
+              config["mode"] = mode
+              save_config(config)
+              console.print(f"\n[green]Mode changed to {mode.upper()}[/green]")
+              continue
+
+            if approval == 'skip':
+              continue
+
+            if not approval:
+              break
+
+            result, display_output, tool_result_text = show_tool_execution(
+              tool_name,
+              args,
+              TOOLS[tool_name],
+              plan_mode=(mode == "plan"),
+              modified_files=modified_files
+            )
+
+            # --- Error + Auto-Retry Handling ---
+            if isinstance(result, str) and result.startswith("Error"):
+              if is_rate_limit_error(result):
+                console.print("[yellow]Rate limited. Waiting 5s and retrying...[/yellow]")
+                time.sleep(5)
+                continue  # auto retry same tool
+
+              action = handle_tool_error(tool_name, result, messages)
+
+              if action == 'retry':
+                continue
+              if action == 'skip':
+                continue
+              if action == 'quit':
+                break
+
+            if isinstance(display_output, list):
+              for item in display_output:
+                console.print(item)
+            elif display_output:
+              console.print(display_output)
+
+            if tool_result_text:
+              truncated = truncate_tool_output(tool_result_text)
+
+              # Format like Claude Code: "[tool_name]\noutput"
+              if p_name == "Anthropic":
+                messages.append({
+                  "role": "assistant",
+                  "content": f"[{tool_name}]\n{truncated}"
+                })
+              else:
+                msg = {
+                  "role": "tool",
+                  "name": tool_name,
+                  "content": truncated
+                }
+                # Add tool_call_id if available (required by some providers)
+                if tool_call_id:
+                  msg["tool_call_id"] = tool_call_id
+                messages.append(msg)
+
+            # Delay between batched tool calls to prevent rate limiting
+            if len(tool_calls) > 1:
+              time.sleep(TOOL_BATCH_DELAY)
+
+          session_id = save_history(messages, session_id)
+          CURRENT_MESSAGES = messages
+          CURRENT_SESSION_ID = session_id
+
+          messages, tokens, limit = compact_context(messages, p_model)
+          console.print(Align.right(Text(f"Context: {(tokens*100)//limit}%", style="dim")))
+
+          # In PLAN mode, auto-continue to build context until plan is ready
+          if mode == "plan" and _agent_steps < 8:
+            console.print("[dim]Building context...[/dim]")
+            time.sleep(1)
+            continue  # Keep planning
+
+          continue  # CRITICAL: never render JSON as assistant output
+
+        # If no tool JSON detected, treat as normal assistant output
+        reasoning = text if text is not None else model_output
 
         # --- Agent step guard (prevents infinite self-loops) ---
         if "_agent_steps" not in locals():
@@ -1570,8 +2037,6 @@ def main():
           ))
           break
 
-        # reply_stripped = reply.strip()
-
         executed_tools = False
 
         if reasoning.strip():
@@ -1584,9 +2049,10 @@ def main():
           for think_block in think_matches:
             think_text = think_block.strip()
             if think_text:
+              # Wrap in [dim] tags to ensure dim color
               console.print(
                 Panel(
-                  think_text,
+                  f"[dim]{think_text}[/dim]",
                   border_style="green",
                   title="Thinking",
                   style="dim"
@@ -1599,9 +2065,10 @@ def main():
             cleaned_output = parts[1].strip() if len(parts) > 1 else ""
 
             if thinking_part:
+              # Wrap in [dim] tags to ensure dim color
               console.print(
                 Panel(
-                  thinking_part,
+                  f"[dim]{thinking_part}[/dim]",
                   border_style="green",
                   title="Thinking",
                   style="dim"
@@ -1629,108 +2096,24 @@ def main():
 
             # Store ONLY final visible output
             messages.append({"role": "assistant", "content": visible_output})
+
+            # In PLAN mode, wait for user after each response (let them continue when ready)
+            if mode == "plan":
+              # Don't auto-continue - wait for user input
+              pass
+
             session_id = save_history(messages, session_id)
             CURRENT_MESSAGES = messages
             CURRENT_SESSION_ID = session_id
 
-        if tool_calls:
-          for tool_call in tool_calls:
-            t_name = tool_call["tool"]
-            args = tool_call.get("args", {})
-
-            if t_name not in TOOLS:
-              err_msg = f"Error: Tool {t_name} not found."
-              console.print(Panel(err_msg, style="bold red"))
-              messages.append({"role": "assistant", "content": err_msg})
-              continue
-
-            # Get approval (handles SAFE, UNSAFE, PLAN modes, and mode toggling)
-            approval = get_tool_approval(
-              t_name, args, mode,
-              plan_mode=(mode == "plan")
-            )
-
-            # Handle mode toggle (Shift+Tab) - cycle through all modes
-            if approval == 'toggle':
-              mode = cycle_mode(mode)
-              config["mode"] = mode
-              save_config(config)
-              mode_display = get_mode_indicator(mode)
-              console.print(f"\n[green]Mode switched to: {mode_display}[/green]\n")
-              banner(mode, config.get("model"))
-              continue
-
-            # Handle PLAN mode (skip execution)
-            if approval == 'skip':
-              executed_tools = False
-              continue
-
-            # Skip if denied
-            if not approval:
-              continue
-
-            executed_tools = True
-
-            # Execute tool with Claude Code-like UX
-            result, display_output, tool_result_text = show_tool_execution(
-              t_name, args, TOOLS[t_name],
-              plan_mode=(mode == "plan"),
-              modified_files=modified_files
-            )
-
-            # Display result(s) in chat
-            if isinstance(display_output, list):
-              for item in display_output:
-                console.print(item)
-            elif display_output:
-              console.print(display_output)
-
-            # Store tool result in messages for context (including errors)
-            if tool_result_text:
-              truncated = truncate_tool_output(tool_result_text)
-
-              # Treat failures specially so model knows to retry
-              is_failure = "TOOL FAILURE:" in truncated
-
-              if p_name == "Anthropic":
-                messages.append({
-                  "role": "assistant",
-                  "content": f"[Tool Result: {t_name}]\n{truncated}"
-                })
-              else:
-                messages.append({
-                  "role": "tool",
-                  "name": t_name,
-                  "content": truncated
-                })
-
-              # If tool failed, ensure we loop again (don't break)
-              executed_tools = True  # Mark that we tried
-            elif result is None:
-              # Tool execution resulted in error - still mark as executed
-              executed_tools = True
-
-          # After executing ALL tools, compact once and call model again
-          session_id = save_history(messages, session_id)
-          CURRENT_MESSAGES = messages
-          CURRENT_SESSION_ID = session_id
-
-          messages, tokens, limit = compact_context(messages, p_model)
-          console.print(Align.right(Text(f"Context: {(tokens*100)//limit}%", style="dim")))
-
-          continue
-
-        # (AUTO-CONTINUE block removed)
-
         break
     except KeyboardInterrupt:
-      quit_choice = Prompt.ask("Quit? [y/N]", choices=["y","n"], default="n", show_default=False)
-      if quit_choice == "y":
-        session_id = save_history(messages, session_id)
-        CURRENT_MESSAGES = messages
-        CURRENT_SESSION_ID = session_id
-        break
-      banner(mode, config.get("model"))
+      # Ctrl+C always quits without sending
+      session_id = save_history(messages, session_id)
+      CURRENT_MESSAGES = messages
+      CURRENT_SESSION_ID = session_id
+      console.print("\n[green]Goodbye![/green]")
+      sys.exit(0)
 
 if __name__ == "__main__":
   main()

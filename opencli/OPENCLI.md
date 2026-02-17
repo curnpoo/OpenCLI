@@ -39,7 +39,10 @@ Your JSON must:
 - Contain only one tool call
 - Contain no extra commentary inside the JSON block
 
-You may optionally include brief reasoning BEFORE the JSON.
+You MUST include brief reasoning BEFORE the JSON tool call. Your reasoning should explain:
+- What you're looking for
+- Why this tool is needed
+- What you expect to find
 
 Example (with reasoning):
 
