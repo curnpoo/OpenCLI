@@ -734,9 +734,11 @@ def show_tool_execution(tool_name, args, tool_func, plan_mode=False, modified_fi
     with console.status(f"[green] {tool_name}[/green] {arg_str}", spinner="dots"):
       result = tool_func(**args)
   except Exception as e:
-    error_msg = f"Error executing {tool_name}: {str(e)}"
+    error_type = type(e).__name__
+    error_msg = f"{tool_name} failed: {error_type}: {str(e)}"
     console.print(Panel(f"[red]{error_msg}[/red]", title=" Tool Error", border_style="red"))
-    return None, "", error_msg
+    # Return error message that will be fed back to model for retry
+    return None, "", f"TOOL FAILURE: {error_msg}\n\nThe {tool_name} tool failed. Please try again with different parameters or approach."
 
   result_text = str(result)
   display_panels = []
@@ -1495,7 +1497,20 @@ def main():
         if "_agent_steps" not in locals():
           _agent_steps = 0
         _agent_steps += 1
-        MAX_AGENT_STEPS = 5
+        MAX_AGENT_STEPS = 20  # Higher limit - keep trying until task completes
+
+        # Show current step progress
+        if _agent_steps > 1:
+          console.print(Align.right(Text(f"[dim]Step {_agent_steps}/{MAX_AGENT_STEPS}[/dim]", style="dim")))
+
+        # Check if we've exceeded max steps
+        if _agent_steps > MAX_AGENT_STEPS:
+          console.print(Panel(
+            f"[red]Max steps ({MAX_AGENT_STEPS}) reached. Task may be incomplete.[/red]\n\nThe agent has made {_agent_steps} attempts. You can continue by providing feedback or asking the agent to try a different approach.",
+            title="Step Limit",
+            border_style="red"
+          ))
+          break
 
         # reply_stripped = reply.strip()
 
@@ -1611,9 +1626,12 @@ def main():
             elif display_output:
               console.print(display_output)
 
-            # Store tool result in messages for context
+            # Store tool result in messages for context (including errors)
             if tool_result_text:
               truncated = truncate_tool_output(tool_result_text)
+
+              # Treat failures specially so model knows to retry
+              is_failure = "TOOL FAILURE:" in truncated
 
               if p_name == "Anthropic":
                 messages.append({
@@ -1626,6 +1644,12 @@ def main():
                   "name": t_name,
                   "content": truncated
                 })
+
+              # If tool failed, ensure we loop again (don't break)
+              executed_tools = True  # Mark that we tried
+            elif result is None:
+              # Tool execution resulted in error - still mark as executed
+              executed_tools = True
 
           # After executing ALL tools, compact once and call model again
           session_id = save_history(messages, session_id)
