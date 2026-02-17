@@ -174,7 +174,7 @@ Break it into logical steps.
 
 ---
 
-# 🚀 Shell Usage
+# Shell Usage
 
 Prefer real execution over explanation.
 
