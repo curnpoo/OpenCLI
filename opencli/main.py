@@ -15,6 +15,7 @@ from rich.live import Live
 from rich.text import Text
 from rich.align import Align
 from rich.table import Table
+from rich.markdown import Markdown
 from rich import box
 import time
 import select
@@ -566,6 +567,44 @@ def extract_json(text):
     # No valid tool JSON found
     return cleaned, None
 
+# --- ADD A NORMALIZER FUNCTION ---
+def normalize_openai_tool_call(data):
+    """
+    Normalize OpenAI-style tool_calls or function_call into
+    internal {"tool": name, "args": {...}} format.
+    """
+    try:
+        if not isinstance(data, dict):
+            return None
+
+        # Handle tool_calls (new OpenAI format)
+        if "choices" in data and data["choices"]:
+            msg = data["choices"][0].get("message", {})
+            if "tool_calls" in msg and msg["tool_calls"]:
+                call = msg["tool_calls"][0]
+                name = call.get("function", {}).get("name")
+                args_raw = call.get("function", {}).get("arguments", "{}")
+                try:
+                    args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                except:
+                    args = {}
+                return {"tool": name, "args": args}
+
+            # Handle legacy function_call
+            if "function_call" in msg:
+                fc = msg["function_call"]
+                name = fc.get("name")
+                args_raw = fc.get("arguments", "{}")
+                try:
+                    args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                except:
+                    args = {}
+                return {"tool": name, "args": args}
+
+        return None
+    except:
+        return None
+
 def check_stop():
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
@@ -611,7 +650,14 @@ def call_model(provider_name, provider_model, key, messages):
         payload = {"model": provider_model, "messages": messages, "stream": True, "max_tokens": max_tokens}
     elif provider_name == "NVIDIA":
         headers["Authorization"] = f"Bearer {key}"
-        payload = {"model": provider_model, "messages": messages, "temperature": 1.0, "stream": True, "chat_template_kwargs": {"thinking": True}, "max_tokens": max_tokens}
+        headers["Accept"] = "text/event-stream"
+        payload = {
+            "model": provider_model,
+            "messages": messages,
+            "temperature": 0.7,
+            "stream": True,
+            "max_tokens": max_tokens
+        }
     elif provider_name == "Anthropic":
         headers["x-api-key"] = key
         headers["anthropic-version"] = "2023-06-01"
@@ -641,9 +687,9 @@ def call_model(provider_name, provider_model, key, messages):
             response = requests.post(url, headers=headers, json=payload, stream=True, timeout=60)
             if response.status_code != 200:
                 try:
-                    err = response.json().get("error", {}).get("message", "Unknown error")
-                    return f"[red]API Error ({response.status_code}): {err}[/red]"
-                except: return f"[red]API Error ({response.status_code}): {response.text[:100]}[/red]"
+                    return f"[red]API Error ({response.status_code}): {response.text}[/red]"
+                except Exception:
+                    return f"[red]API Error ({response.status_code}): Unknown response[/red]"
 
             for line in response.iter_lines():
                 if check_stop(): break
@@ -674,8 +720,35 @@ def call_model(provider_name, provider_model, key, messages):
                         except: pass
 
         if thinking_text or full_text:
-            if thinking_text and full_text: return f"[dim]💭 Thinking: {thinking_text}[/dim]\n\n{full_text}"
+            final_text = full_text.strip()
+
+            # 1️⃣ Normalize OpenAI-style tool_calls / function_call
+            try:
+                parsed = json.loads(final_text)
+                normalized = normalize_openai_tool_call(parsed)
+                if normalized:
+                    return json.dumps(normalized)
+            except:
+                pass
+
+            # 2️⃣ Normalize NVIDIA-style tool format:
+            # <|tool_call_begin|> functions.read_file:5 ...
+            if "<|tool_call_begin|>" in final_text:
+                try:
+                    name_match = re.search(r'functions\.(\w+)', final_text)
+                    arg_match = re.search(r'\{.*\}', final_text, re.DOTALL)
+                    if name_match and arg_match:
+                        tool_name = name_match.group(1)
+                        args = json.loads(arg_match.group(0))
+                        return json.dumps({"tool": tool_name, "args": args})
+                except:
+                    pass
+
+            # 3️⃣ Fallback to normal text output
+            if thinking_text and full_text:
+                return f"[dim]💭 Thinking: {thinking_text}[/dim]\n\n{full_text}"
             return thinking_text or full_text
+
         return "[dim](Empty response)[/dim]"
     except Exception as e: return f"[red]Error: {str(e)}[/red]"
 
@@ -744,9 +817,21 @@ def main():
     # If resumed, display previous conversation
     if resumed:
         banner(config.get("mode", "safe"), config.get("model"))
-        for m in messages:
+        total_msgs = len(messages)
+        tool_count = len([m for m in messages if m.get("role") == "tool"])
+        console.print(Panel(
+            f"[bold]Session Summary[/bold]\n"
+            f"Messages: {total_msgs}\n"
+            f"Tool Calls: {tool_count}\n"
+            f"Working Dir: {os.getcwd()}",
+            border_style="cyan"
+        ))
+
+        # Show only last 6 conversational turns (no tool dumps)
+        conversational = [m for m in messages if m["role"] in ("user", "assistant")]
+        for m in conversational[-6:]:
             if m["role"] == "assistant":
-                console.print(Panel(m["content"], style="cyan", title="OpenCLI 💭"))
+                console.print(Panel(m["content"][:800], style="cyan", title="OpenCLI 💭"))
             elif m["role"] == "user":
                 console.print(f"[bold {get_theme_color('text')}]You[/bold {get_theme_color('text')}] › {m['content']}")
 
@@ -801,10 +886,20 @@ def main():
                     session_id = sel["id"]
                     banner(config.get("mode", "safe"), config.get("model"))
 
-                    # Display previous conversation
-                    for m in messages:
+                    total_msgs = len(messages)
+                    tool_count = len([m for m in messages if m.get("role") == "tool"])
+                    console.print(Panel(
+                        f"[bold]Session Summary[/bold]\n"
+                        f"Messages: {total_msgs}\n"
+                        f"Tool Calls: {tool_count}\n"
+                        f"Working Dir: {os.getcwd()}",
+                        border_style="cyan"
+                    ))
+
+                    conversational = [m for m in messages if m["role"] in ("user", "assistant")]
+                    for m in conversational[-6:]:
                         if m["role"] == "assistant":
-                            console.print(Panel(m["content"], style="cyan", title="OpenCLI 💭"))
+                            console.print(Panel(m["content"][:800], style="cyan", title="OpenCLI 💭"))
                         elif m["role"] == "user":
                             console.print(f"[bold {get_theme_color('text')}]You[/bold {get_theme_color('text')}] › {m['content']}")
                 continue
@@ -829,9 +924,39 @@ def main():
                 # ====== NEW LOGIC: Assistant message → tool call (tool JSON not stored in history) ======
                 reasoning, tool_call = extract_json(reply)
 
+                # --- ENSURE extract_json HANDLES RAW JSON TOOL RETURNS CLEANLY ---
+                # If model returned raw JSON (OpenAI-normalized), parse it directly
+                if not tool_call:
+                    try:
+                        parsed = json.loads(reply.strip())
+                        if isinstance(parsed, dict) and "tool" in parsed:
+                            tool_call = parsed
+                            reasoning = ""
+                    except:
+                        pass
+
+                # Require planning text before first tool in a turn
+                if tool_call and not reasoning.strip():
+                    console.print(
+                        Panel(
+                            "Model attempted tool call without plan.\n\nRequesting planning step first.",
+                            style="yellow",
+                            title="Plan Required"
+                        )
+                    )
+                    messages.append({
+                        "role": "assistant",
+                        "content": "Please describe your plan before using tools."
+                    })
+                    session_id = save_history(messages, session_id)
+                    break
+
                 # If the model included normal text, show it and store it
                 if reasoning.strip():
-                    console.print(Panel(reasoning, style="cyan", title="OpenCLI 💭"))
+                    md = Markdown(reasoning)
+                    console.print(
+                        Panel(md, border_style="cyan", title="OpenCLI 💭")
+                    )
                     messages.append({"role": "assistant", "content": reasoning})
                     session_id = save_history(messages, session_id)
 
@@ -861,14 +986,29 @@ def main():
 
                     try:
                         result = TOOLS[t_name](**args)
-                        console.print(Panel(str(result)[:500] + ("..." if len(str(result)) > 500 else ""), title=f"Tool: {t_name}"))
+                        truncated = str(result)
+                        if len(truncated) > 300:
+                            truncated = truncated[:300] + "\n\n[dim]... output truncated ...[/dim]"
+                        console.print(
+                            Panel(
+                                truncated,
+                                title=f"Tool: {t_name}",
+                                border_style="green"
+                            )
+                        )
 
-                        # Feed tool result back into conversation
-                        messages.append({"role": "user", "content": f"RESULT: {result}"})
+                        # Append structured tool result (do NOT trigger immediate model recall)
+                        messages.append({
+                            "role": "tool",
+                            "name": t_name,
+                            "content": str(result)
+                        })
+
                         session_id = save_history(messages, session_id)
 
-                        # Continue loop so model decides next step
-                        continue
+                        # Break inner loop so we return to outer loop
+                        # and bundle tool results into next single model call
+                        break
 
                     except Exception as e:
                         err_msg = f"Error executing tool '{t_name}': {str(e)}"
