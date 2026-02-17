@@ -1075,9 +1075,9 @@ def get_tool_approval(tool_name, args, mode, plan_mode=False):
       )
     )
 
-    # Show instructions
-    instructions = "[bold green]y[/bold green] approve • [bold red]n[/bold red] deny • [bold]Shift+Tab[/bold] cycle mode"
-    console.print(instructions, justify="center")
+    # Show mode indicator and instructions
+    mode_display = get_mode_indicator(mode)
+    console.print(f"{mode_display} [dim]y approve • n deny • Shift+Tab cycle mode[/dim]")
 
     # Get response (supports mode toggle)
     while True:
@@ -1270,7 +1270,7 @@ def call_model(provider_name, provider_model, key, messages):
   except Exception as e: return f"[red]Error: {str(e)}[/red]"
 
 def get_multiline_input(prompt="› "):
-  """Multi-line input: Enter to send, Shift+Enter for newline."""
+  """Multi-line input: Enter to send, Shift+Enter for newline, Shift+Tab to cycle mode."""
   if HAS_PROMPT_TOOLKIT:
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.keys import Keys
@@ -1289,6 +1289,11 @@ def get_multiline_input(prompt="› "):
       """Insert newline on Shift+Enter"""
       event.current_buffer.insert_text('\n')
 
+    @kb.add(Keys.ShiftTab)  # Shift+Tab to cycle modes
+    def _(event):
+      """Cycle mode on Shift+Tab"""
+      event.app.exit_with_exception(KeyboardInterrupt("MODE_CYCLE"))
+
     @kb.add(Keys.Escape)
     def _(event):
       """Cancel with Escape"""
@@ -1301,7 +1306,10 @@ def get_multiline_input(prompt="› "):
         multiline=True,
         editing_mode=EditingMode.VI,
       )
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as e:
+      # Check if this is a mode cycle request
+      if str(e) == "MODE_CYCLE":
+        return "MODE_CYCLE"
       return ""
   else:
     console.print(f"[bold {get_theme_color('text')}]{prompt}[/bold {get_theme_color('text')}]", end="")
@@ -1442,7 +1450,22 @@ def main():
         "[dim](/ → settings • /resume → load chat • /clear → reset • exit → quit)[/dim]"
       )
       console.print(f"{mode_text} [dim]Enter=send • Shift+Enter=newline • Shift+Tab=cycle mode[/dim]")
-      user_input = get_multiline_input("› ")
+
+      # Get input with mode cycling support
+      while True:
+        user_input = get_multiline_input("› ")
+
+        # Handle mode cycling via Shift+Tab
+        if user_input == "MODE_CYCLE":
+          mode = cycle_mode(mode)
+          config["mode"] = mode
+          save_config(config)
+          mode_text = get_mode_indicator(mode)
+          console.print(f"\n{mode_text} Mode changed\n")
+          # Show mode indicator again and re-prompt
+          console.print(f"{mode_text} [dim]Enter=send • Shift+Enter=newline • Shift+Tab=cycle mode[/dim]")
+          continue
+        break
 
       if user_input.strip() == "/":
         interactive_settings_menu()
