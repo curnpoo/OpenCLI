@@ -1254,7 +1254,7 @@ def get_tool_approval(tool_name, args, mode, plan_mode=False, thinking=""):
 
     # Show approval panel for write/destructive tools
     console.print()
-    title = f"{'[bold red] DESTRUCTIVE[/bold red] ' if is_destructive else ''}[bold green]Approve?[/bold green]"
+    title = f"{('[bold red] DESTRUCTIVE[/bold red] ' if is_destructive else '')}[bold green]Approve?[/bold green]"
     console.print(
       Panel(
         tool_info,
@@ -1288,7 +1288,7 @@ def get_tool_approval(tool_name, args, mode, plan_mode=False, thinking=""):
       # If None (invalid key or Enter), loop and ask again
       elif response is None:
         continue
-    # UNSAFE mode: show but don't ask
+  if mode == "unsafe":
     console.print()
     console.print(
       Panel(
@@ -1301,6 +1301,8 @@ def get_tool_approval(tool_name, args, mode, plan_mode=False, thinking=""):
     instructions = "[dim]→ [bold]Shift+Tab[/bold] to toggle to SAFE mode[/dim]"
     console.print(instructions, justify="center")
     return True
+  return True
+
 
 def call_model(provider_name, provider_model, key, messages):
   headers = {"Content-Type": "application/json"}
