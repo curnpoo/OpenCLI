@@ -6,6 +6,8 @@ authors = [
   { name="curren" }
 ]
 dependencies = [
+  "filelock",
+  "Pillow",
   "requests",
   "rich"
 ]
