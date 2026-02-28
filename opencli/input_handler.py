@@ -201,6 +201,10 @@ class DynamicInput:
     
     def _process_escape(self, seq: str) -> str:
         """Process escape sequences into readable keys."""
+        # Single ESC press should cancel input/paste mode.
+        if seq == '\x1b':
+            return 'ESC'
+
         escape_map = {
             '\x1b[A': 'UP',
             '\x1b[B': 'DOWN', 
