@@ -1288,7 +1288,7 @@ def get_tool_approval(tool_name, args, mode, plan_mode=False, thinking=""):
       # If None (invalid key or Enter), loop and ask again
       elif response is None:
         continue
-    # UNSAFE mode: show but don't ask
+  elif mode == "unsafe":
     console.print()
     console.print(
       Panel(
@@ -1300,6 +1300,9 @@ def get_tool_approval(tool_name, args, mode, plan_mode=False, thinking=""):
     )
     instructions = "[dim]→ [bold]Shift+Tab[/bold] to toggle to SAFE mode[/dim]"
     console.print(instructions, justify="center")
+    return True
+  else:
+    # Default fallback for unknown modes: auto-approve
     return True
 
 def call_model(provider_name, provider_model, key, messages):
