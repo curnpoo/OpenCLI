@@ -9,7 +9,8 @@ dependencies = [
   "filelock",
   "Pillow",
   "requests",
-  "rich"
+  "rich",
+  "textual>=0.100.0"
 ]
 
 [project.scripts]

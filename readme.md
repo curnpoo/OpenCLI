@@ -1,196 +1,209 @@
 OpenCLI
+======
 
-OpenCLI is an open-source terminal coding agent.
+OpenCLI is an autonomous terminal coding agent.
 
-If you’ve used Claude Code or Codex and thought:
+Give it a task, walk away, and it keeps working until the task is complete.
 
-“I want this… but I want to control it.”
+No SaaS lock-in. No black box magic. Just a local, hackable, extensible agent that runs in your terminal.
 
-This is that.
+---
 
-No SaaS lock-in.
-No black box magic.
-Just a local, hackable, extensible agent that runs in your terminal.
-
-⸻
-
-What It Is
+## What It Is
 
 OpenCLI is a developer-first AI coding assistant designed to:
-	•	Read and modify files
-	•	Run shell commands
-	•	Batch tool calls
-	•	Plan before acting
-	•	Ask for approval in safe mode
-	•	Run fully autonomous in unsafe mode
-	•	Resume sessions
-	•	Handle multiple parallel terminal windows safely
+- **Autonomously execute tasks** - Give a command and it works until done
+- **Read and modify files** - Full file system access
+- **Run shell commands** - npm, git, build tools, etc.
+- **Plan before acting** - Analyzes before making changes
+- **Ask for approval in safe mode** - Single keystroke (y/n)
+- **Run fully autonomous in unsafe mode** - No delays, continuous execution
+- **Resume sessions** - Pick up where you left off
+- **Handle multiple parallel windows** - Isolated sessions with file locking
 
-It behaves like a serious coding agent, not a chatbot pretending to be one.
+It behaves like a competent developer working with you — not a chatbot.
 
-⸻
+---
 
-Why It Exists
+## Why It Exists
 
-Claude Code and Codex are powerful.
-
-But they’re:
-	•	Closed source
-	•	Opinionated
-	•	Not fully inspectable
-	•	Not easily extendable
+Claude Code and Codex are powerful. But they're:
+- Closed source
+- Opinionated
+- Not fully inspectable
 
 OpenCLI gives you:
-	•	Full control over prompts
-	•	Full control over tooling
-	•	Full control over models
-	•	Full control over execution behavior
-	•	The ability to run multiple agents in parallel
+- Full control over prompts
+- Full control over tooling
+- Full control over models
+- Full control over execution behavior
+- The ability to run autonomous agents and walk away
 
-It’s meant to be modified.
+It's meant to be modified. If something feels wrong, you can fix it.
 
-If something feels wrong, you can fix it.
+---
 
-⸻
+## Agentic Workflow
 
-Features
-	•	Plan → Batch Tool Execution → Final Reasoning loop
-	•	OpenAI-style function calling
-	•	Parallel session support (isolated session files + file locking)
-	•	Tool approval system (SAFE mode)
-	•	Fully autonomous mode (UNSAFE)
-	•	PLAN mode (analysis-only, no execution)
-	•	Context compaction with smart token counting
-	•	Resume previous sessions
-	•	Multiple provider support (Anthropic, OpenRouter, NVIDIA, Gemini, Ollama, etc.)
-	•	Clean green-themed terminal UI with visible reasoning separation
-	•	Response timing metrics (how long each response took)
-	•	Token counting (input/output estimation)
-	•	File diffs with color-coded changes
-	•	Single-key tool approval (y/n, no Enter needed)
-	•	Mode toggle with Shift+Tab
-	•	Modified file tracking per session
-	•	Destructive tool warnings
+OpenCLI is designed as an **autonomous agent**, not a chatbot:
 
-⸻
+1. **Give a task**: "Fix the login bug" or "Add dark mode to the app"
+2. **It works**: Reads files, runs commands, makes changes
+3. **Keeps going**: Iterates until the task is complete
+4. **Reports back**: Summarizes what was done
 
-Philosophy
+**You can give a command and walk away.** It will:
+- Explore the codebase to understand the problem
+- Make surgical edits
+- Run tests and verify fixes
+- Continue iterating until the task is fulfilled
 
-OpenCLI is built around a few rules:
-	•	Do not scan the whole repo unless needed
-	•	Do not act on greetings
-	•	Plan before modifying
-	•	Prefer minimal edits over rewrites
-	•	Never hide what the agent is doing
-	•	Keep thinking visible but separate from output
+Up to 20 steps per task. Each model response + tool execution = 1 step.
 
-It should feel like a competent developer working with you — not replacing you.
+---
 
-⸻
+## Quick Start
 
-Install
-
+```bash
 pip install opencli
+```
 
 Or clone and install locally:
 
+```bash
 git clone https://github.com/yourname/opencli.git
 cd opencli
 pip install -e .
+```
 
 Then run:
 
+```bash
 opencli
+```
 
+---
 
-⸻
+## Commands
 
-Modes
+| Command | Description |
+|---------|-------------|
+| `/` | Open settings menu |
+| `/resume` | Resume a previous session |
+| `/clear` | Start a fresh session |
+| `exit` or `Ctrl+C` | Quit the application |
 
-SAFE (Green)
-	•	Requires approval for each tool
-	•	Single-key approval (y/n)
-	•	Good for destructive operations
-	•	Default mode
+---
 
-UNSAFE (Red)
-	•	Executes tools automatically
-	•	Meant for trusted environments
-	•	No approval delays
+## Modes
 
-PLAN (Dark Green)
-	•	Read-only analysis mode
-	•	Learns and understands code
-	•	Never executes tools
-	•	Perfect for exploration
+### SAFE (Green) - Default
+- Requires approval for each tool call
+- Single-key approval (y/n) - no Enter needed
+- Good for destructive operations or when you want oversight
 
-Switch with Shift+Tab or via /settings
-Approval requires single keystroke - no Enter needed!
+### UNSAFE (Red)
+- Executes tools automatically
+- Meant for trusted environments
+- No approval delays
+- **Give a task and walk away** - it will keep working
 
-⸻
+### PLAN (Dark Green)
+- Read-only analysis mode
+- Learns and understands code
+- Never executes tools
+- Perfect for exploration and understanding
 
-Parallel Sessions
+**Switch modes**: Press `Shift+Tab` or use `/settings`
 
-You can run:
+---
 
-opencli
+## Features
 
-in multiple terminal windows simultaneously.
+- **Autonomous execution** - Work until task completion
+- **Plan → Tool Execution → Final Reasoning loop**
+- **OpenAI-style function calling**
+- **Parallel session support** - Multiple windows, isolated files + locking
+- **Context compaction** - Smart token management
+- **Multiple providers** - Anthropic, OpenRouter, NVIDIA, Gemini, Ollama, etc.
+- **Response timing metrics**
+- **Token counting** (input/output estimation)
+- **File diffs** with color-coded changes
+- **Modified file tracking** per session
+
+---
+
+## Parallel Sessions
+
+You can run `opencli` in multiple terminal windows simultaneously.
 
 Each session:
-	•	Gets a unique UUID
-	•	Writes to its own session file
-	•	Uses file locking for safety
+- Gets a unique UUID
+- Writes to its own session file
+- Uses file locking for safety
 
-No race conditions.
-No history corruption.
+No race conditions. No history corruption.
 
-⸻
+---
 
-Models
+## Models
 
-Use whatever model you want.
+Use whatever model you want. OpenCLI doesn't care.
 
-OpenCLI doesn’t care.
-
-Claude Sonnet.
-Claude Opus.
-Kimi.
-Gemini.
-OpenRouter.
+- Claude Sonnet / Opus
+- Kimi
+- Gemini
+- OpenRouter (any model)
+- Ollama (local models)
 
 If it supports function calling, it works here.
 
-⸻
+---
 
-Is It Production Ready?
+## Configuration
 
-It’s stable.
+Run `/` to access settings:
+- **Provider** - Choose your API provider
+- **Model** - Select the model
+- **Ollama URL** - For local models
+- **Theme** - UI color preferences
+- **Execution Mode** - SAFE / UNSAFE / PLAN
 
-But it’s also meant to evolve.
+---
 
-If you want a frozen appliance, this isn’t it.
+## Philosophy
+
+OpenCLI is built around a few rules:
+- Do not scan the whole repo unless needed
+- Do not act on greetings
+- Plan before modifying
+- Prefer minimal edits over rewrites
+- Never hide what the agent is doing
+- Keep thinking visible but separate from output
+
+---
+
+## Is It Production Ready?
+
+It's stable. But it's also meant to evolve.
+
+If you want a frozen appliance, this isn't it.
 
 If you want something you can tune, modify, and push further — it is.
 
-⸻
+---
 
-Contributing
+## Contributing
 
-Pull requests welcome.
+Pull requests welcome. If you break it and make it better, even better.
 
-If you break it and make it better, even better.
+---
 
-⸻
-
-Final Note
+## Final Note
 
 OpenCLI is for people who:
-	•	Like understanding their tools
-	•	Want autonomous coding agents
-	•	Don’t want to surrender control
+- Like understanding their tools
+- Want autonomous coding agents
+- Don't want to surrender control
 
-If you wanted Claude Code —
-but open source —
-
-this is it.
+If you wanted Claude Code — but open source — this is it.
